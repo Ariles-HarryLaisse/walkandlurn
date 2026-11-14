@@ -1,6 +1,6 @@
 # ============================================================
 # WALKING AI — Apprentissage (Python, exécuté dans le navigateur via Pyodide)
-# Un réseau de neurones (10 sorties, 1 couche cachée) est entraîné
+# Un réseau de neurones (11 sorties, 1 couche cachée) est entraîné
 # par stratégies d'évolution : à chaque génération, plusieurs variantes
 # sont testées, et les meilleures orientent la génération suivante.
 # La physique est déléguée à physics.js (window.sim).
@@ -11,9 +11,9 @@ import json
 import asyncio
 import numpy as np
 
-N_OBS = 27          # taille de l'observation (voir physics.js : observe())
-N_ACT = 10          # une commande par articulation
-N_HID = 16          # neurones cachés
+N_OBS = 29          # taille de l'observation : 11 articulations x2 (angle, vitesse) + 7 (voir physics.js)
+N_ACT = 11          # une commande par articulation, colonne vertébrale comprise
+N_HID = 18          # neurones cachés
 N_PARAMS = N_OBS * N_HID + N_HID + N_HID * N_ACT + N_ACT
 
 POP = 12            # variantes testées par génération
@@ -104,7 +104,12 @@ class Learner:
     @staticmethod
     def from_dict(d):
         L = Learner()
-        L.theta = np.array(d["theta"], dtype=float)
+        theta = np.array(d["theta"], dtype=float)
+        if theta.shape[0] != N_PARAMS:
+            # Sauvegarde d'une ancienne version du corps (nombre d'articulations différent) :
+            # on repart d'un réseau neuf plutôt que de charger des poids incompatibles.
+            return Learner()
+        L.theta = theta
         L.gen = d["gen"]
         L.attempts = d["attempts"]
         L.falls = d["falls"]

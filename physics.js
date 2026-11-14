@@ -30,19 +30,25 @@ const V = (x, y) => planck.Vec2(x, y);
 // Ordre des 10 actions envoyées par l'IA (valeurs entre -1 et 1)
 const ACT = ["hipL", "kneeL", "ankleL", "shL", "elbL", "hipR", "kneeR", "ankleR", "shR", "elbR"];
 
-// Articulations souples : couple = ressort (kp) + amortissement (kd), borné par max (N·m).
+// Articulations souples : couple = ressort (kp) vers la cible + amortissement critique (calculé
+// dynamiquement à partir de l'inertie réelle), borné par max (N·m).
 // c = angle central, r = amplitude de la consigne autour de c.
+// damping : 1.0 = amortissement critique (aucune oscillation), <1 = un peu plus vivant.
 const MOT = {
-  hip:   { c: 0.3,  r: 0.9, kp: 120, kd: 8,   max: 150 },
-  knee:  { c: -0.4, r: 1.0, kp: 90,  kd: 6,   max: 120 },
-  ankle: { c: 0.0,  r: 0.5, kp: 40,  kd: 3,   max: 50 },
-  sh:    { c: 0.0,  r: 2.0, kp: 6,   kd: 1.2, max: 20 },
-  elb:   { c: -1.2, r: 1.0, kp: 4,   kd: 0.8, max: 12 },
+  hip:   { c: 0.3,  r: 0.9, kp: 70, max: 150, damping: 0.9 },
+  knee:  { c: -0.4, r: 1.0, kp: 55, max: 120, damping: 0.9 },
+  ankle: { c: 0.0,  r: 0.5, kp: 25, max: 50,  damping: 0.9 },
+  sh:    { c: 0.0,  r: 2.0, kp: 5,  max: 20,  damping: 0.85 },
+  elb:   { c: -1.2, r: 1.0, kp: 4,  max: 12,  damping: 0.85 },
 };
 const kindOf = (n) => n.replace(/[LR]$/, "");
 
+// Lissage des commandes reçues de l'IA : évite les à-coups d'une consigne à l'autre.
+const SMOOTH_TAU = 0.08; // secondes
+
 let world, B = {}, J = {}, JD = {}, DIMS = {}, HEAD_START = 1, X0 = 0;
-let targets = {};
+let targets = {};     // consignes brutes envoyées par l'IA
+let smoothed = {};    // consignes lissées, réellement utilisées
 
 function part(name, x, y, angle, hx, hy, dens = DENS) {
   const b = world.createBody({ type: "dynamic", position: V(x * K, y * K), angle, angularDamping: 0.02 });
@@ -69,7 +75,7 @@ function initPhysics() { build(); }
 function build() {
   world = planck.World({ gravity: V(0, -9.8) });
   world.createBody().createFixture(planck.Edge(V(-500, 0), V(500, 0)), { friction: 0.9 });
-  B = {}; J = {}; JD = {}; DIMS = {}; targets = {};
+  B = {}; J = {}; JD = {}; DIMS = {}; targets = {}; smoothed = {};
   const h = 1.1; // hauteur de la hanche avant mise à l'échelle
 
   part("torso", 0, h + 0.35, Math.PI / 2, 0.35, 0.12, 40);
@@ -111,13 +117,21 @@ function observe() {
 
 function isFallen() { return B.head.getPosition().y < 0.55 * HEAD_START; }
 
+// Couple = ressort critique vers la cible lissée. L'amortissement critique est calculé à partir
+// de l'inertie réelle de chaque membre, ce qui évite les oscillations et les à-coups rigides.
 function applyTorques() {
   for (const n of ACT) {
     const m = MOT[kindOf(n)];
+    const alpha = DT / (DT + SMOOTH_TAU);
+    smoothed[n] = (smoothed[n] || 0) + ((targets[n] || 0) - (smoothed[n] || 0)) * alpha;
+
     const q = J[n].getJointAngle();
     const qd = J[n].getJointSpeed();
-    const target = m.c + (targets[n] || 0) * m.r;
-    let tau = m.kp * (target - q) - m.kd * qd;
+    const target = m.c + smoothed[n] * m.r;
+
+    const I = Math.max(JD[n].b.getInertia(), 1e-4);
+    const kd = m.damping * 2 * Math.sqrt(m.kp * I);
+    let tau = m.kp * (target - q) - kd * qd;
     tau = Math.max(-m.max, Math.min(m.max, tau));
     JD[n].b.applyTorque(tau, true);
     JD[n].a.applyTorque(-tau, true);
@@ -149,6 +163,8 @@ function toScreen(x, y, camX) {
   return { x: canvas.width / 2 + (x - camX) * PX, y: canvas.height - GROUND_PX - y * PX };
 }
 
+// Dessine un membre comme une capsule arrondie avec un dégradé, pour un rendu plus organique
+// qu'un simple trait.
 function drawLimb(name, camX) {
   const b = B[name];
   const [hx, hy] = DIMS[name];
@@ -156,7 +172,21 @@ function drawLimb(name, camX) {
   const dx = Math.cos(a) * hx, dy = Math.sin(a) * hx;
   const A = toScreen(p.x - dx, p.y - dy, camX);
   const Z = toScreen(p.x + dx, p.y + dy, camX);
-  ctx.lineWidth = hy * 2 * PX;
+  const width = hy * 2 * PX;
+
+  const grad = ctx.createLinearGradient(A.x, A.y - width / 2, A.x, A.y + width / 2);
+  grad.addColorStop(0, "#f3c9a0");
+  grad.addColorStop(0.5, "#e0a878");
+  grad.addColorStop(1, "#c98a5c");
+
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(Z.x, Z.y); ctx.stroke();
+
+  // léger contour pour détacher le membre du fond
+  ctx.strokeStyle = "rgba(90,55,30,0.35)";
+  ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(Z.x, Z.y); ctx.stroke();
 }
 
@@ -166,12 +196,28 @@ function draw() {
   ctx.fillStyle = "#5a7d3a";
   ctx.fillRect(0, y0, canvas.width, GROUND_PX);
   const camX = B.torso.getPosition().x;
-  ctx.strokeStyle = "#222";
-  ctx.lineCap = "round";
-  for (const n of Object.keys(DIMS)) drawLimb(n, camX);
+
+  // membres, torse en dernier pour qu'il recouvre les attaches des bras/jambes
+  const order = Object.keys(DIMS).filter((n) => n !== "torso");
+  for (const n of order) drawLimb(n, camX);
+  drawLimb("torso", camX);
+
+  // articulations : petits ronds discrets de la même teinte, pas de points rouges
+  ctx.fillStyle = "#e0a878";
+  for (const n of Object.keys(JD)) {
+    const j = J[n];
+    const anchor = j.getAnchorA();
+    const pt = toScreen(anchor.x, anchor.y, camX);
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, 6.283); ctx.fill();
+  }
+
+  // tête
   const hp = B.head.getPosition();
   const H = toScreen(hp.x, hp.y, camX);
-  ctx.fillStyle = "#222";
+  const headGrad = ctx.createRadialGradient(H.x - 4, H.y - 4, 2, H.x, H.y, HEAD_R * K * PX);
+  headGrad.addColorStop(0, "#f3c9a0");
+  headGrad.addColorStop(1, "#d89b6c");
+  ctx.fillStyle = headGrad;
   ctx.beginPath(); ctx.arc(H.x, H.y, HEAD_R * K * PX, 0, 6.283); ctx.fill();
 }
 

@@ -4,29 +4,99 @@
 <meta charset="UTF-8">
 <title>LEZARD AI – 1000 lézards apprennent à grimper</title>
 <style>
-  body { font-family: sans-serif; margin: 0; background: #1e1e2e; color: #eee; }
+  html, body { height: 100%; }
+  body { font-family: sans-serif; margin: 0; background: #1e1e2e; color: #eee; overflow: hidden; }
+  #layout { display: flex; height: 100vh; }
+  #left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #bar { padding: 8px 12px; background: #2a2a3e; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   button { padding: 6px 12px; cursor: pointer; }
   #status { margin-left: auto; font-size: 14px; }
-  #stats { padding: 6px 12px; background: #242438; font-family: monospace; font-size: 13px; min-height: 18px; }
-  canvas { display: block; background: #cfe8ff; width: 100%; height: calc(100vh - 100px); }
+  #stats { padding: 6px 12px; background: #242438; font-family: monospace; font-size: 12px; min-height: 16px; }
+  #cwrap { flex: 1; position: relative; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: #cfe8ff; }
+
+  #panel { width: 310px; background: #232336; border-left: 1px solid #3a3a55; overflow-y: auto; padding: 10px 12px; font-size: 13px; box-sizing: border-box; }
+  #panel h3 { margin: 0 0 8px; font-size: 15px; }
+  #panel h4 { margin: 14px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #9aa0c0; }
+  .bar { height: 10px; background: #3a3a55; border-radius: 5px; overflow: hidden; margin: 6px 0; }
+  #pBar { height: 100%; width: 0; background: #7CFC9A; transition: width .3s; }
+  .small { font-size: 11px; color: #b5b8d0; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .card { background: #2c2c44; border-radius: 6px; padding: 6px 8px; }
+  .card .k { font-size: 10px; color: #9aa0c0; text-transform: uppercase; }
+  .card .v { font-size: 15px; font-weight: bold; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { text-align: left; color: #9aa0c0; font-weight: normal; border-bottom: 1px solid #3a3a55; padding: 2px 3px; }
+  td { padding: 2px 3px; border-bottom: 1px solid #2f2f48; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; }
 </style>
 </head>
 <body>
-<div id="bar">
-  <button id="btnPause">Pause</button>
-  <button id="btnResume">Reprendre</button>
-  <button id="btnReset">Réinitialiser</button>
-  <button id="btnSave">Sauvegarder</button>
-  <button id="btnLoad">Charger</button>
-  <label>Vitesse <input type="range" id="speed" min="1" max="100" value="1">
-    <span id="speedLabel">×1</span></label>
-  <label title="Simule au maximum de la vitesse de votre machine">
-    <input type="checkbox" id="turbo"> Turbo</label>
-  <span id="status">Chargement…</span>
+<div id="layout">
+  <div id="left">
+    <div id="bar">
+      <button id="btnPause">Pause</button>
+      <button id="btnResume">Reprendre</button>
+      <button id="btnReset">Réinitialiser</button>
+      <button id="btnSave">Sauvegarder</button>
+      <button id="btnLoad">Charger</button>
+      <label>Vitesse <input type="range" id="speed" min="1" max="100" value="1">
+        <span id="speedLabel">×1</span></label>
+      <label title="Simule au maximum de la vitesse de votre machine">
+        <input type="checkbox" id="turbo"> Turbo</label>
+      <label><input type="checkbox" id="showPanel" checked> Panneau</label>
+      <span id="status">Chargement…</span>
+    </div>
+    <div id="stats">En attente…</div>
+    <div id="cwrap"><canvas id="cv"></canvas></div>
+  </div>
+
+  <aside id="panel">
+    <h3>Tableau de bord</h3>
+
+    <h4>Génération en cours : <span id="pGen">0</span></h4>
+    <div class="bar"><div id="pBar"></div></div>
+    <div class="small" id="pProg">en attente…</div>
+
+    <h4>Résultats</h4>
+    <div class="grid">
+      <div class="card"><div class="k">Record absolu</div><div class="v" id="pRecord">–</div></div>
+      <div class="card"><div class="k">Meilleur en ce moment</div><div class="v" id="pNow">–</div></div>
+      <div class="card"><div class="k">Meilleur gén. précédente</div><div class="v" id="pLast">–</div></div>
+      <div class="card"><div class="k">Moyenne gén. précédente</div><div class="v" id="pMean">–</div></div>
+    </div>
+    <div class="card" style="margin-top:6px"><div class="k">Niveau</div><div class="v" id="pLevel">–</div></div>
+
+    <h4>Répartition des lézards</h4>
+    <div class="grid">
+      <div class="card"><span class="dot" style="background:#7CFC9A"></span><span class="k">Actifs</span> <b id="pActive">0</b></div>
+      <div class="card"><span class="dot" style="background:#f5c542"></span><span class="k">Épuisés</span> <b id="pTired">0</b></div>
+      <div class="card"><span class="dot" style="background:#e06666"></span><span class="k">Tombés</span> <b id="pFell">0</b></div>
+      <div class="card"><span class="dot" style="background:#9aa0a6"></span><span class="k">Temps écoulé</span> <b id="pTime">0</b></div>
+    </div>
+
+    <h4>Meilleurs en ce moment</h4>
+    <table><tr><th>#</th><th>Lézard</th><th>Hauteur</th><th>État</th></tr><tbody id="pTop"></tbody></table>
+
+    <h4>Corps des survivants (moyenne)</h4>
+    <div class="grid">
+      <div class="card"><div class="k">Masse du squelette</div><div class="v" id="pMass">–</div></div>
+      <div class="card"><div class="k">Force des muscles</div><div class="v" id="pMusc">–</div></div>
+      <div class="card"><div class="k">Réserve d'énergie</div><div class="v" id="pEn">–</div></div>
+      <div class="card"><div class="k">Poids total</div><div class="v" id="pKg">–</div></div>
+    </div>
+    <div class="small" style="margin-top:4px">Énergie consommée par le meilleur : <b id="pEnergy">–</b></div>
+
+    <h4>Dernières générations</h4>
+    <table>
+      <tr><th>Gén.</th><th>Best</th><th>Moy.</th><th>J</th><th>kg</th><th>Mas.</th><th>Mus.</th><th>Én.</th></tr>
+      <tbody id="pRows"></tbody>
+    </table>
+
+    <h4>Simulation</h4>
+    <div class="small">Vitesse réelle : <b id="pSpeed">–</b></div>
+  </aside>
 </div>
-<div id="stats">En attente…</div>
-<canvas id="cv"></canvas>
 
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
 <script>
@@ -48,6 +118,10 @@ document.getElementById("speed").oninput = (e) => {
 document.getElementById("turbo").onchange = (e) => { ui.turbo = e.target.checked; };
 document.getElementById("btnSave").onclick = () => { window.requestSave = true; };
 document.getElementById("btnLoad").onclick = () => { window.requestLoad = true; };
+document.getElementById("showPanel").onchange = (e) => {
+  document.getElementById("panel").style.display = e.target.checked ? "block" : "none";
+  resize();
+};
 
 async function startPython() {
   try {
@@ -65,6 +139,8 @@ async function startPython() {
 
 try {
   if (typeof createLizard === "undefined") throw new Error("physics.js n'a pas été chargé");
+  if (typeof renderLoop === "undefined") throw new Error("view.js n'a pas été chargé");
+  resize();
   requestAnimationFrame(renderLoop);
   startPython();
 } catch (err) {

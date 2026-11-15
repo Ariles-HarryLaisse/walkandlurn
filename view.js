@@ -25,6 +25,8 @@ let perfHistory = [];
 window.setStats = (txt) => { statsEl.textContent = txt; };
 window.setHistory = (txt) => { try { perfHistory = JSON.parse(txt); } catch (e) { perfHistory = []; } };
 window.setGen = (g) => { view.gen = g; };
+let panelData = null;
+window.setPanel = (txt) => { try { panelData = JSON.parse(txt); } catch (e) { panelData = null; } };
 window.waitFrame = () => new Promise((r) => requestAnimationFrame(r));
 
 // Cède la main au navigateur sans attendre la prochaine image (mode turbo)
@@ -307,4 +309,66 @@ function draw() {
   drawChart();
 }
 
-function renderLoop() { draw(); requestAnimationFrame(renderLoop); }
+
+// ============================================================
+// Panneau « tableau de bord » (HTML, à droite de l'écran)
+// ============================================================
+const $ = (id) => document.getElementById(id);
+const fmt = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : "–");
+let _lastPanel = 0;
+
+function updatePanel() {
+  if (!$("panel") || $("panel").style.display === "none") return;
+  const pop = view.pop || (panelData ? panelData.pop : 0);
+
+  // avancement de la génération en cours : part des lézards déjà éliminés (épuisés ou tombés)
+  const counts = [0, 0, 0, 0];
+  let best = 0;
+  for (let i = 0; i < view.states.length; i++) {
+    counts[view.states[i]]++;
+    if (view.gains[i] > best) best = view.gains[i];
+  }
+  const done = pop ? pop - view.alive : 0;
+  const pct = pop ? Math.round((100 * done) / pop) : 0;
+  $("pGen").textContent = view.gen;
+  $("pBar").style.width = pct + "%";
+  $("pProg").textContent = done + " / " + pop + " lézards éliminés (" + pct + " %) · temps simulé " + fmt(view.simT, 1) + " s";
+  $("pActive").textContent = counts[0];
+  $("pTired").textContent = counts[1];
+  $("pFell").textContent = counts[2];
+  $("pTime").textContent = counts[3];
+  $("pNow").textContent = fmt(best, 2) + " m";
+  $("pSpeed").textContent = "×" + fmt(view.speedX, 0) + " · " + view.workers + " workers";
+
+  // classement en direct
+  const idx = Array.from(view.gains.keys()).sort((a, b) => view.gains[b] - view.gains[a]).slice(0, 5);
+  const names = ["actif", "épuisé", "tombé", "temps écoulé"];
+  $("pTop").innerHTML = idx.map((i, r) =>
+    "<tr><td>" + (r + 1) + "</td><td>n° " + i + "</td><td>" + fmt(view.gains[i], 2) + " m</td><td>" + names[view.states[i]] + "</td></tr>"
+  ).join("");
+
+  if (panelData) {
+    const d = panelData, s = d.last;
+    $("pLevel").textContent = d.level;
+    $("pRecord").textContent = fmt(d.best_ever, 2) + " m";
+    if (s) {
+      $("pLast").textContent = fmt(s.best, 2) + " m";
+      $("pMean").textContent = fmt(s.mean, 2) + " m";
+      $("pEnergy").textContent = fmt(s.energy, 0) + " J";
+      $("pMass").textContent = "×" + fmt(s.g_mass, 2);
+      $("pMusc").textContent = "×" + fmt(s.g_musc, 2);
+      $("pEn").textContent = "×" + fmt(s.g_en, 2);
+      $("pKg").textContent = fmt(s.kg, 2) + " kg";
+    }
+    $("pRows").innerHTML = (d.rows || []).slice().reverse().map((r) =>
+      "<tr><td>" + r[0] + "</td><td>" + fmt(r[1], 2) + "</td><td>" + fmt(r[2], 2) + "</td><td>" + fmt(r[3], 0) +
+      "</td><td>" + fmt(r[4], 2) + "</td><td>×" + fmt(r[5], 2) + "</td><td>×" + fmt(r[6], 2) + "</td><td>×" + fmt(r[7], 2) + "</td></tr>"
+    ).join("");
+  }
+}
+
+function renderLoop(ts) {
+  draw();
+  if (ts - _lastPanel > 300) { _lastPanel = ts; updatePanel(); }
+  requestAnimationFrame(renderLoop);
+}

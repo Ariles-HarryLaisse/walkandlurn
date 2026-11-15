@@ -72,6 +72,7 @@ class Population:
         self.best_ever = 0.0
         self.history = []                        # [meilleur, moyenne] de hauteur par génération
         self.last = None                         # statistiques de la dernière génération
+        self.table = []                          # une ligne par génération, pour le panneau
 
 
 def level(best):
@@ -98,6 +99,14 @@ def publish(S):
             f"· Poids moyen {s['kg']:.2f} kg · Niveau {level(S.best_ever)}"
         )
     js.window.setGen(S.gen)
+    push_panel(S)
+
+
+def push_panel(S):
+    js.window.setPanel(json.dumps({
+        "gen": S.gen, "level": level(S.best_ever), "best_ever": S.best_ever,
+        "last": S.last, "rows": S.table[-8:], "pop": POP, "elite": ELITE,
+    }))
 
 
 def push_history(S):
@@ -137,6 +146,9 @@ async def run_generation(S):
     S.genes = np.concatenate([parents_g, mutate_genes(parents_g)])
 
     S.gen += 1
+    S.table.append([S.gen, S.last["best"], S.last["mean"], S.last["energy"], S.last["kg"],
+                    S.last["g_mass"], S.last["g_musc"], S.last["g_en"]])
+    S.table = S.table[-200:]
     S.history.append([S.last["best"], S.last["mean"]])
     S.history = S.history[-400:]
     push_history(S)
@@ -149,7 +161,7 @@ def save(S):
     # après une sélection, les premiers lézards sont les meilleurs, classés
     js.window.localStorage.setItem(SAVE_KEY, json.dumps({
         "k": k, "brains": b64(S.brains[:k]), "genes": b64(S.genes[:k]),
-        "gen": S.gen, "best_ever": S.best_ever, "history": S.history,
+        "gen": S.gen, "best_ever": S.best_ever, "history": S.history, "table": S.table,
     }))
 
 
@@ -171,6 +183,7 @@ def load():
         S.gen = int(d.get("gen", 0))
         S.best_ever = float(d.get("best_ever", 0.0))
         S.history = d.get("history", [])
+        S.table = d.get("table", [])
         return S
     except Exception:
         return None

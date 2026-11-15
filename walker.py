@@ -1,9 +1,13 @@
 # ============================================================
-# WALKING AI — Apprentissage (Python, exécuté dans le navigateur via Pyodide)
-# Un réseau de neurones (11 sorties, 1 couche cachée) est entraîné
-# par stratégies d'évolution : à chaque génération, plusieurs variantes
-# sont testées, et les meilleures orientent la génération suivante.
+# LEZARD AI — Apprentissage (Python, exécuté dans le navigateur via Pyodide)
+# Un réseau de neurones pilote 10 muscles et 4 griffes. Il est entraîné par
+# stratégies d'évolution : à chaque génération, 16 variantes (8 paires
+# symétriques) grimpent à l'arbre ; les meilleures orientent la suivante.
 # La physique est déléguée à physics.js (window.sim).
+#
+# Aucune séquence de pattes n'est programmée. Seule une récompense de stabilité
+# (garder au moins 3 griffes plantées) pousse le lézard à ne bouger qu'une patte
+# à la fois : main, jambe, autre main, autre jambe... c'est à lui de le découvrir.
 # ============================================================
 
 import js
@@ -11,18 +15,22 @@ import json
 import asyncio
 import numpy as np
 
-N_OBS = 29          # taille de l'observation : 11 articulations x2 (angle, vitesse) + 7 (voir physics.js)
-N_ACT = 11          # une commande par articulation, colonne vertébrale comprise
-N_HID = 18          # neurones cachés
+# Tailles lues dans physics.js : jamais de décalage entre corps et réseau
+N_OBS = int(js.window.simInfo.nObs)
+N_ACT = int(js.window.simInfo.nAct)
+H0 = float(js.window.simInfo.h0)   # hauteur de départ de la poitrine
+N_GRIP = 4                         # les 4 dernières sorties commandent les griffes
+N_HID = 20
 N_PARAMS = N_OBS * N_HID + N_HID + N_HID * N_ACT + N_ACT
 
-POP = 12            # variantes testées par génération
-SIGMA = 0.1         # amplitude des variations testées
-LR = 0.05           # vitesse d'apprentissage
-MAX_STEPS = 12 * 60 # durée maximale d'un essai (12 s à 60 pas/s)
-FALL_TIME = 1.0     # rester au sol plus de 1 s = essai terminé (chute)
+POP = 16                # variantes par génération (paires symétriques)
+SIGMA = 0.1             # amplitude des variations testées
+LR = 0.06               # vitesse d'apprentissage
+MAX_STEPS = 14 * 60     # durée maximale d'un essai : 14 s
+STAGNATION = 5.0        # sans progrès en hauteur pendant 5 s : l'essai s'arrête
+GOAL_GAIN = 1.5         # hauteur à gagner pour atteindre le sommet (m)
 
-SAVE_KEY = "walking_ai_save"
+SAVE_KEY = "lizard_ai_save"
 
 
 class Reset(Exception):
@@ -45,6 +53,12 @@ def policy(theta, obs):
     return np.tanh(h @ W2 + b2)
 
 
+def fresh_theta():
+    th = np.random.randn(N_PARAMS) * 0.1
+    th[-N_GRIP:] = 1.5      # au départ, le lézard a tendance à s'agripper
+    return th
+
+
 async def pace(k):
     """Respecte pause / réinitialisation / vitesse choisies dans l'interface."""
     ui = js.window.ui
@@ -59,37 +73,17 @@ async def pace(k):
         await js.window.waitFrame()
 
 
-async def run_episode(theta):
-    obs = json.loads(js.window.sim.reset())
-    steps = 0
-    fallen_t = 0.0
-    fell = False
-    dx = 0.0
-    while steps < MAX_STEPS:
-        await pace(steps)
-        a = policy(theta, np.nan_to_num(np.array(obs, dtype=float)))
-        res = json.loads(js.window.sim.step(json.dumps(a.tolist())))
-        obs = res["obs"]
-        dx = res["dx"]
-        steps += 1
-        fallen_t = fallen_t + 1 / 60 if res["fallen"] else 0.0
-        if fallen_t >= FALL_TIME:
-            fell = True
-            break
-    t = steps / 60
-    reward = 3.0 * dx + 0.5 * t - (5.0 if fell else 0.0)
-    return reward, dx, t, fell
-
-
 class Learner:
     def __init__(self):
-        self.theta = np.random.randn(N_PARAMS) * 0.1
+        self.theta = fresh_theta()
         self.gen = 0
         self.attempts = 0
         self.falls = 0
-        self.best_dist = 0.0
+        self.best_gain = 0.0
         self.best_alive = 0.0
-        self.last_dist = 0.0
+        self.last_gain = 0.0
+        self.last_grips = [1, 1, 1, 1]
+        self.history = []       # [meilleur, moyenne] de hauteur gagnée par génération
 
     def to_dict(self):
         return {
@@ -97,44 +91,92 @@ class Learner:
             "gen": self.gen,
             "attempts": self.attempts,
             "falls": self.falls,
-            "best_dist": self.best_dist,
+            "best_gain": self.best_gain,
             "best_alive": self.best_alive,
+            "history": self.history,
         }
 
     @staticmethod
     def from_dict(d):
-        L = Learner()
         theta = np.array(d["theta"], dtype=float)
         if theta.shape[0] != N_PARAMS:
-            # Sauvegarde d'une ancienne version du corps (nombre d'articulations différent) :
-            # on repart d'un réseau neuf plutôt que de charger des poids incompatibles.
-            return Learner()
+            return Learner()    # sauvegarde d'un autre corps : on repart d'un réseau neuf
+        L = Learner()
         L.theta = theta
-        L.gen = d["gen"]
-        L.attempts = d["attempts"]
-        L.falls = d["falls"]
-        L.best_dist = d["best_dist"]
-        L.best_alive = d["best_alive"]
+        L.gen = d.get("gen", 0)
+        L.attempts = d.get("attempts", 0)
+        L.falls = d.get("falls", 0)
+        L.best_gain = d.get("best_gain", 0.0)
+        L.best_alive = d.get("best_alive", 0.0)
+        L.history = d.get("history", [])
         return L
 
 
 def level(L):
-    if L.best_dist >= 15 and L.best_alive >= 10:
-        return "5 - marche durablement"
-    if L.best_dist >= 5:
-        return "4 - marche"
-    if L.best_dist >= 1:
-        return "3 - quelques pas"
-    if L.best_alive >= 2:
-        return "2 - équilibre bref"
-    return "1 - incapable de tenir debout"
+    if L.best_gain >= GOAL_GAIN:
+        return "5 - atteint le sommet"
+    if L.best_gain >= 0.6:
+        return "4 - grimpe"
+    if L.best_gain >= 0.15:
+        return "3 - monte un peu"
+    if L.best_alive >= 4:
+        return "2 - tient accroché"
+    return "1 - tombe tout de suite"
 
 
-def publish(L):
+def publish(L, live=None):
+    gain, grips = (live if live else (L.last_gain, L.last_grips))
+    gs = "".join("●" if g else "○" for g in grips)
     js.window.setStats(
-        f"Génération {L.gen} · Tentatives {L.attempts} · Distance {L.last_dist:.2f} m · "
-        f"Chutes {L.falls} · Meilleur {L.best_dist:.2f} m · Niveau {level(L)}"
+        f"Génération {L.gen} · Tentatives {L.attempts} · Hauteur {gain:.2f} m · "
+        f"Chutes {L.falls} · Record {L.best_gain:.2f} m · "
+        f"Prises (AG AD RG RD) {gs} · Niveau {level(L)}"
     )
+
+
+def push_history(L):
+    js.window.setHistory(json.dumps(L.history))
+
+
+async def run_episode(theta, L):
+    obs = json.loads(js.window.sim.reset())
+    steps = 0
+    max_y = H0
+    t_improve = 0.0
+    stab = 0.0              # secondes passées avec au moins 3 griffes plantées
+    fell = False
+    success = False
+    grips = [1, 1, 1, 1]
+    while steps < MAX_STEPS:
+        await pace(steps)
+        a = policy(theta, np.nan_to_num(np.array(obs, dtype=float)))
+        res = json.loads(js.window.sim.step(json.dumps(a.tolist())))
+        obs = res["obs"]
+        y = res["y"]
+        grips = res["grips"]
+        steps += 1
+        t = steps / 60
+        if y > max_y + 0.01:
+            max_y = y
+            t_improve = t
+        if sum(grips) >= 3:
+            stab += 1 / 60
+        if steps % 6 == 0:
+            publish(L, live=(max(0.0, max_y - H0), grips))
+        if res["fallen"]:
+            fell = True
+            break
+        if res["success"]:
+            success = True
+            break
+        if t - t_improve > STAGNATION:
+            break
+    gain = max(0.0, max_y - H0)
+    t = steps / 60
+    reward = 15.0 * gain + 0.3 * stab + (20.0 if success else 0.0) - (3.0 if fell else 0.0)
+    L.last_gain = gain
+    L.last_grips = grips
+    return reward, gain, t, fell
 
 
 def save(L):
@@ -152,7 +194,7 @@ def load():
 
 
 async def check_save_load(L):
-    """Vérifie les boutons Sauvegarder / Charger à chaque génération."""
+    """Vérifie les boutons Sauvegarder / Charger entre deux générations."""
     if getattr(js.window, "requestSave", False):
         js.window.requestSave = False
         save(L)
@@ -160,31 +202,41 @@ async def check_save_load(L):
         js.window.requestLoad = False
         loaded = load()
         if loaded is not None:
+            push_history(loaded)
             return loaded
     return L
 
 
 async def run_generation(L):
-    noise = np.random.randn(POP, N_PARAMS)
+    half = POP // 2
+    eps = np.random.randn(half, N_PARAMS)
+    noise = np.concatenate([eps, -eps])      # paires symétriques : estimation plus fiable
     rewards = np.zeros(POP)
+    gains = []
     for i in range(POP):
-        reward, dx, t, fell = await run_episode(L.theta + SIGMA * noise[i])
+        reward, gain, t, fell = await run_episode(L.theta + SIGMA * noise[i], L)
         rewards[i] = reward
+        gains.append(gain)
         L.attempts += 1
         if fell:
             L.falls += 1
-        L.last_dist = dx
-        L.best_dist = max(L.best_dist, dx)
+        L.best_gain = max(L.best_gain, gain)
         L.best_alive = max(L.best_alive, t)
         publish(L)
-    advantage = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-    L.theta = L.theta + LR * (noise.T @ advantage) / (POP * SIGMA)
+    # Classement des récompenses (robuste aux valeurs extrêmes)
+    ranks = rewards.argsort().argsort().astype(float)
+    adv = ranks / (POP - 1) - 0.5
+    L.theta = L.theta + LR * (noise.T @ adv) / (POP * SIGMA)
     L.gen += 1
+    L.history.append([float(max(gains)), float(np.mean(gains))])
+    L.history = L.history[-400:]
+    push_history(L)
     publish(L)
 
 
 async def train():
     L = load() or Learner()
+    push_history(L)
     publish(L)
     while True:
         try:
@@ -193,6 +245,7 @@ async def train():
             L = await check_save_load(L)
         except Reset:
             L = Learner()
+            push_history(L)
             publish(L)
 
 

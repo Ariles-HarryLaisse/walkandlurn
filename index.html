@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>WALKING AI</title>
+<title>LEZARD AI – il apprend à grimper</title>
 <style>
   body { font-family: sans-serif; margin: 0; background: #1e1e2e; color: #eee; }
   #bar { padding: 8px 12px; background: #2a2a3e; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -19,7 +19,7 @@
   <button id="btnReset">Réinitialiser</button>
   <button id="btnSave">Sauvegarder</button>
   <button id="btnLoad">Charger</button>
-  <label>Vitesse <input type="range" id="speed" min="1" max="10" value="1"></label>
+  <label>Vitesse <input type="range" id="speed" min="1" max="40" value="1"></label>
   <span id="status">Chargement de la physique…</span>
 </div>
 <div id="stats">En attente…</div>
@@ -42,7 +42,7 @@ async function startPython() {
   try {
     statusEl.textContent = "Chargement de Python et numpy…";
     const pyodide = await loadPyodide();
-    const code = await (await fetch("walker.py")).text();
+    const code = await (await fetch("walker.py?v=" + Date.now())).text();
     await pyodide.loadPackagesFromImports(code);
     statusEl.textContent = "Apprentissage en cours";
     await pyodide.runPythonAsync(code);

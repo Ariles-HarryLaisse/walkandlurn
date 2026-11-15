@@ -1,7 +1,8 @@
 // ============================================================
-// WALKING AI — Physique (planck.js, portage de Box2D)
-// Construit le bonhomme, applique les commandes de l'IA,
-// gère le sol et expose tout à Python via window.sim.
+// LEZARD AI — Physique (planck.js, portage de Box2D)
+// Le plan de l'écran est le plan du tronc : le lézard est vu de face,
+// collé à l'écorce comme un gecko sur un mur. La gravité le tire vers le bas.
+// Chaque patte peut planter sa griffe dans le tronc (joint) ou la retirer.
 // ============================================================
 
 const canvas = document.getElementById("cv");
@@ -15,134 +16,206 @@ function resize() { canvas.width = canvas.clientWidth; canvas.height = canvas.cl
 window.addEventListener("resize", resize);
 resize();
 
-// ---------- Constantes ----------
-const PX = 220;             // pixels par mètre à l'écran
-const K = 0.7;              // échelle générale du bonhomme (plus petit que nature)
-const THIN = 0.5;           // épaisseur des membres (plus petit = plus fin)
-const DT = 1 / 240;         // pas de physique fixe
-const SUBSTEPS = 4;         // pas physiques par action (1 action = 1/60 s de jeu)
-const DENS = 55;            // densité des membres (kg/m²)
-const NO_SELF = -1;         // groupe de filtrage : les membres ne se heurtent pas entre eux
-const GROUND_PX = 90;       // hauteur du sol à l'écran (pixels)
-const HEAD_R = 0.12;        // rayon de la tête (m)
+// ---------- Constantes générales ----------
+const PX = 260;              // pixels par mètre à l'écran
+const DT = 1 / 240;          // pas de physique fixe
+const SUBSTEPS = 4;          // pas physiques par action (1 action = 1/60 s)
+const NO_SELF = -1;          // les membres ne se heurtent pas entre eux
 const V = (x, y) => planck.Vec2(x, y);
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const deg = (d) => (d * Math.PI) / 180;
 
-// Ordre des 11 actions envoyées par l'IA (valeurs entre -1 et 1).
-// "spine" permet au buste de se pencher pour chercher l'équilibre, comme un vrai corps.
-const ACT = ["spine", "hipL", "kneeL", "ankleL", "shL", "elbL", "hipR", "kneeR", "ankleR", "shR", "elbR"];
+// ---------- Arbre ----------
+const TRUNK_HALF = 0.6;      // demi-largeur du tronc (m) : on ne peut s'accrocher que dessus
+const START_Y = 1.0;         // hauteur de la colonne vertébrale au départ
+const H0 = START_Y + 0.13;   // hauteur de départ du centre de la poitrine
+const GOAL_Y = H0 + 1.5;     // sommet à atteindre
+const TREE_TOP = GOAL_Y + 0.9;
+const FALL_Y = 0.75;         // sous cette hauteur, le lézard est considéré comme tombé
 
-// Articulations souples : couple = ressort (kp) vers la cible + amortissement critique (calculé
-// dynamiquement à partir de l'inertie réelle), borné par max (N·m).
-// c = angle central, r = amplitude de la consigne autour de c.
-// damping : 1.0 = amortissement critique (aucune oscillation), <1 = un peu plus vivant/naturel.
-const MOT = {
-  spine: { c: 0.0,  r: 0.5, kp: 35, max: 70,  damping: 0.9 },
-  hip:   { c: 0.25, r: 0.9, kp: 55, max: 130, damping: 0.9 },
-  knee:  { c: -0.35,r: 1.0, kp: 45, max: 110, damping: 0.9 },
-  ankle: { c: 0.0,  r: 0.5, kp: 20, max: 45,  damping: 0.9 },
-  sh:    { c: 0.0,  r: 2.0, kp: 5,  max: 18,  damping: 0.85 },
-  elb:   { c: -1.2, r: 1.0, kp: 4,  max: 11,  damping: 0.85 },
+// ---------- Griffes ----------
+const GRIP_MAX = 70;         // force (N) au-delà de laquelle la griffe glisse et lâche
+const MIN_HOLD = 0.2;        // durée minimale (s) entre deux changements d'état d'une griffe
+
+// ---------- Corps : paramètres qui évolueront avec la sélection naturelle ----------
+// massScale multiplie la masse de tout le corps ; strength multiplie la force des muscles.
+const BODY = { massScale: 1.0, strength: 1.0 };
+
+// ---------- Muscles (moteurs d'articulation) ----------
+// r = amplitude de la consigne (rad), tmax = couple maximal (N·m) = force du muscle,
+// gain = réactivité, vmax = vitesse angulaire maximale (rad/s).
+const JT = {
+  spine: { r: 0.6, tmax: 4.0, gain: 6, vmax: 3 },
+  tail1: { r: 0.8, tmax: 0.8, gain: 5, vmax: 3 },
+  sh:    { r: 1.2, tmax: 4.0, gain: 8, vmax: 5 },
+  el:    { r: 1.6, tmax: 3.0, gain: 8, vmax: 6 },
+  tailp: { r: 0.0, tmax: 0.3, gain: 3, vmax: 2 },   // bout de queue : passif, souple
 };
-const kindOf = (n) => n.replace(/[LR]$/, "");
+const SMOOTH_TAU = 0.08;     // lissage des commandes de l'IA (s)
+const GAIT_T = 1.6;          // période de l'horloge interne fournie à l'IA (s)
 
-// Lissage des commandes reçues de l'IA : évite les à-coups d'une consigne à l'autre.
-const SMOOTH_TAU = 0.1; // secondes
+// Actions de l'IA : 10 muscles puis 4 griffes (>0 = accrochée)
+const CTRL = ["spine", "tail1", "shFL", "elFL", "shFR", "elFR", "shRL", "elRL", "shRR", "elRR"];
+const LIMBS = ["FL", "FR", "RL", "RR"];   // avant-gauche, avant-droite, arrière-gauche, arrière-droite
 
-let world, B = {}, J = {}, JD = {}, DIMS = {}, HEAD_START = 1, X0 = 0;
-let targets = {};     // consignes brutes envoyées par l'IA
-let smoothed = {};    // consignes lissées, réellement utilisées
+// Dimensions des pattes (m)
+const LU = 0.12, LL = 0.14;
 
-function part(name, x, y, angle, hx, hy, dens = DENS) {
-  const b = world.createBody({ type: "dynamic", position: V(x * K, y * K), angle, angularDamping: 0.04, linearDamping: 0.0 });
-  const th = hy * THIN;
-  DIMS[name] = [hx * K, th * K];
-  b.createFixture(planck.Box(hx * K, th * K), { density: dens, friction: 0.9, restitution: 0.0, filterGroupIndex: NO_SELF });
+const typeOf = (n) => {
+  if (n.startsWith("sh")) return "sh";
+  if (n.startsWith("el")) return "el";
+  if (n === "tail2" || n === "tail3") return "tailp";
+  return n;
+};
+// Les pattes de droite sont le miroir de celles de gauche : même commande = mouvement symétrique
+const signOf = (n) => ((n.startsWith("sh") || n.startsWith("el")) && n.endsWith("R") ? -1 : 1);
+
+let world, GROUND, B = {}, J = {}, DIMS = {};
+let targets = {}, smoothed = {}, grips = {}, gripTimer = {};
+let simT = 0, noGripT = 0, camY = null;
+
+// ---------- Construction ----------
+function part(name, cx, cy, angle, hx, hy, dens) {
+  const b = world.createBody({ type: "dynamic", position: V(cx, cy), angle: angle, angularDamping: 0.1 });
+  b.createFixture(planck.Box(hx, hy), {
+    density: dens * BODY.massScale, friction: 0.8, restitution: 0.0, filterGroupIndex: NO_SELF,
+  });
+  DIMS[name] = [hx, hy];
   B[name] = b;
+  return b;
 }
 
 function hinge(name, a, b, ax, ay, lo, hi) {
+  const t = JT[typeOf(name)].tmax * BODY.strength;
   const def = {
     referenceAngle: b.getAngle() - a.getAngle(),
     enableLimit: true, lowerAngle: lo, upperAngle: hi,
-    enableMotor: false,
+    enableMotor: true, maxMotorTorque: t, motorSpeed: 0,
     collideConnected: false,
   };
-  J[name] = world.createJoint(planck.RevoluteJoint(def, a, b, V(ax * K, ay * K)));
-  JD[name] = { a, b };
+  J[name] = world.createJoint(planck.RevoluteJoint(def, a, b, V(ax, ay)));
 }
 
-// ---------- Construction du bonhomme ----------
-function initPhysics() { build(); }
+function limb(l, root, rx, ry, a1, a2) {
+  const ex = rx + Math.cos(a1) * LU, ey = ry + Math.sin(a1) * LU;
+  const fx = ex + Math.cos(a2) * LL, fy = ey + Math.sin(a2) * LL;
+  part("up" + l, (rx + ex) / 2, (ry + ey) / 2, a1, LU / 2, 0.022, 15);
+  part("low" + l, (ex + fx) / 2, (ey + fy) / 2, a2, LL / 2, 0.018, 15);
+  // griffe : petit disque au bout de l'avant-bras
+  B["low" + l].createFixture(planck.Circle(V(LL / 2, 0), 0.022), {
+    density: 15 * BODY.massScale, friction: 0.8, restitution: 0.0, filterGroupIndex: NO_SELF,
+  });
+  hinge("sh" + l, root, B["up" + l], rx, ry, -1.3, 1.3);
+  hinge("el" + l, B["up" + l], B["low" + l], ex, ey, -1.8, 1.8);
+}
 
 function build() {
   world = planck.World({ gravity: V(0, -9.8) });
-  world.createBody().createFixture(planck.Edge(V(-500, 0), V(500, 0)), { friction: 1.0, restitution: 0.0 });
-  B = {}; J = {}; JD = {}; DIMS = {}; targets = {}; smoothed = {};
-  const h = 1.1; // hauteur de la hanche avant mise à l'échelle
+  GROUND = world.createBody();
+  GROUND.createFixture(planck.Edge(V(-50, 0), V(50, 0)), { friction: 1.0, restitution: 0.0 });
+  B = {}; J = {}; DIMS = {};
+  targets = {}; smoothed = {}; grips = {}; gripTimer = {};
+  simT = 0; noGripT = 0; camY = null;
+  const y0 = START_Y;
 
-  // Bassin (racine : les hanches et la colonne partent d'ici)
-  part("pelvis", 0, h + 0.10, Math.PI / 2, 0.18, 0.10, 45);
-  // Poitrine, reliée au bassin par la colonne : c'est elle qui porte bras, cou et tête
-  part("chest",  0, h + 0.45, Math.PI / 2, 0.22, 0.11, 35);
+  // Tronc du lézard : bassin en bas, poitrine en haut (axe local x = vers le haut)
+  part("chest", 0, y0 + 0.13, Math.PI / 2, 0.13, 0.055, 20);
+  part("pelvis", 0, y0 - 0.13, Math.PI / 2, 0.13, 0.05, 20);
+  // Tête : un disque fixé en haut de la poitrine
+  B.chest.createFixture(planck.Circle(V(0.17, 0), 0.06), {
+    density: 20 * BODY.massScale, friction: 0.8, restitution: 0.0, filterGroupIndex: NO_SELF,
+  });
+  hinge("spine", B.pelvis, B.chest, 0, y0, -0.6, 0.6);
 
-  for (const [sd, s] of [["L", -1], ["R", 1]]) {
-    part("thigh" + sd, s * 0.07, h - 0.22, -Math.PI / 2, 0.22, 0.07);
-    part("shin" + sd,  s * 0.07, h - 0.66, -Math.PI / 2, 0.22, 0.06);
-    part("foot" + sd,  s * 0.03, h - 0.92, 0, 0.18, 0.04);
-    part("uarm" + sd,  s * 0.12, h + 0.58, -Math.PI / 2, 0.13, 0.05);
-    part("farm" + sd,  s * 0.12, h + 0.32, -Math.PI / 2, 0.13, 0.045);
-  }
-  HEAD_START = (h + 0.92) * K;
-  const head = world.createBody({ type: "dynamic", position: V(0, HEAD_START), angularDamping: 0.04 });
-  head.createFixture(planck.Circle(HEAD_R * K), { density: DENS, friction: 0.9, restitution: 0.0, filterGroupIndex: NO_SELF });
-  B.head = head;
+  // Queue : 3 segments qui pendent sous le bassin
+  part("tail1", 0, y0 - 0.26 - 0.07, -Math.PI / 2, 0.07, 0.03, 10);
+  part("tail2", 0, y0 - 0.40 - 0.06, -Math.PI / 2, 0.06, 0.022, 10);
+  part("tail3", 0, y0 - 0.52 - 0.05, -Math.PI / 2, 0.05, 0.015, 10);
+  hinge("tail1", B.pelvis, B.tail1, 0, y0 - 0.26, -0.8, 0.8);
+  hinge("tail2", B.tail1, B.tail2, 0, y0 - 0.40, -0.8, 0.8);
+  hinge("tail3", B.tail2, B.tail3, 0, y0 - 0.52, -0.8, 0.8);
 
-  hinge("spine", B.pelvis, B.chest, 0, h + 0.28, -0.3, 0.5);
-  hinge("neck", B.chest, B.head, 0, h + 0.80, -0.8, 0.8);
-  for (const [sd, s] of [["L", -1], ["R", 1]]) {
-    const xh = s * 0.07, xs = s * 0.12;
-    hinge("hip" + sd,   B.pelvis,        B["thigh" + sd], xh, h,        -0.8, 2.2);
-    hinge("knee" + sd,  B["thigh" + sd], B["shin" + sd],  xh, h - 0.44, -2.6, 0.3);
-    hinge("ankle" + sd, B["shin" + sd],  B["foot" + sd],  xh, h - 0.88, -0.9, 0.9);
-    hinge("sh" + sd,    B.chest,         B["uarm" + sd], xs, h + 0.70, -3.0, 3.0);
-    hinge("elb" + sd,   B["uarm" + sd],  B["farm" + sd], xs, h + 0.45, -2.8, 0.4);
-  }
-  X0 = B.pelvis.getPosition().x;
+  // Pattes écartées : (angle du haut de la patte, angle du bas)
+  limb("FL", B.chest, -0.04, y0 + 0.20, deg(150), deg(110));
+  limb("FR", B.chest, 0.04, y0 + 0.20, deg(30), deg(70));
+  limb("RL", B.pelvis, -0.04, y0 - 0.20, deg(210), deg(250));
+  limb("RR", B.pelvis, 0.04, y0 - 0.20, deg(330), deg(290));
+
+  for (const n of CTRL) smoothed[n] = 0;
+  // Au départ, les 4 griffes sont plantées dans le tronc
+  for (const l of LIMBS) { grips[l] = null; gripTimer[l] = 1; attach(l, footTip(l)); }
 }
 
-// ---------- Capteurs (ce que l'IA observe à chaque pas) ----------
+function initPhysics() {
+  build();
+  window.simInfo = { nObs: observe().length, nAct: CTRL.length + LIMBS.length, h0: H0 };
+}
+
+// ---------- Griffes ----------
+function footTip(l) { return B["low" + l].getWorldPoint(V(LL / 2, 0)); }
+
+function attach(l, p) {
+  grips[l] = world.createJoint(planck.RevoluteJoint({ collideConnected: false }, B["low" + l], GROUND, p));
+  gripTimer[l] = 0;
+}
+
+function release(l) {
+  if (grips[l]) { world.destroyJoint(grips[l]); grips[l] = null; }
+  gripTimer[l] = 0;
+}
+
+function updateGrips(cmd) {
+  for (const l of LIMBS) {
+    gripTimer[l] += 1 / 60;
+    const want = cmd[l] > 0;
+    const g = grips[l];
+    if (g) {
+      const f = g.getReactionForce(1 / DT);
+      if (Math.hypot(f.x, f.y) > GRIP_MAX) { release(l); continue; }     // la griffe glisse
+      if (!want && gripTimer[l] > MIN_HOLD) release(l);
+    } else if (want && gripTimer[l] > MIN_HOLD) {
+      const p = footTip(l);
+      if (Math.abs(p.x) < TRUNK_HALF && p.y > 0.04 && p.y < TREE_TOP) attach(l, p);
+    }
+  }
+}
+
+const gripCount = () => LIMBS.filter((l) => grips[l]).length;
+
+// ---------- Muscles ----------
+function setMotors() {
+  const alpha = 1 / 60 / (1 / 60 + SMOOTH_TAU);
+  for (const n of CTRL) {
+    smoothed[n] += ((targets[n] || 0) - smoothed[n]) * alpha;
+    const m = JT[typeOf(n)];
+    const tgt = signOf(n) * m.r * smoothed[n];
+    const w = clamp(m.gain * (tgt - J[n].getJointAngle()), -m.vmax, m.vmax);
+    J[n].setMotorSpeed(w);
+  }
+  for (const n of ["tail2", "tail3"]) {
+    const m = JT.tailp;
+    J[n].setMotorSpeed(clamp(m.gain * (0 - J[n].getJointAngle()), -m.vmax, m.vmax));
+  }
+}
+
+// ---------- Capteurs (ce que l'IA observe) ----------
 function observe() {
   const o = [];
-  for (const n of ACT) o.push(J[n].getJointAngle() / Math.PI, J[n].getJointSpeed() / 10);
+  for (const n of CTRL) {
+    const s = signOf(n);
+    o.push((s * J[n].getJointAngle()) / Math.PI, (s * J[n].getJointSpeed()) / 10);
+  }
   let a = B.chest.getAngle() - Math.PI / 2;
   a = Math.atan2(Math.sin(a), Math.cos(a));
-  const v = B.pelvis.getLinearVelocity();
-  o.push(a / Math.PI, B.chest.getAngularVelocity() / 10, v.x / 3, v.y / 3, B.head.getPosition().y / HEAD_START);
-  o.push(B.footL.getPosition().y < 0.1 * K ? 1 : 0, B.footR.getPosition().y < 0.1 * K ? 1 : 0);
-  return o;
-}
-
-function isFallen() { return B.head.getPosition().y < 0.55 * HEAD_START; }
-
-// Couple = ressort critique vers la cible lissée. L'amortissement critique est calculé à partir
-// de l'inertie réelle de chaque membre, ce qui évite les oscillations et les à-coups rigides.
-function applyTorques() {
-  for (const n of ACT) {
-    const m = MOT[kindOf(n)];
-    const alpha = DT / (DT + SMOOTH_TAU);
-    smoothed[n] = (smoothed[n] || 0) + ((targets[n] || 0) - (smoothed[n] || 0)) * alpha;
-
-    const q = J[n].getJointAngle();
-    const qd = J[n].getJointSpeed();
-    const target = m.c + smoothed[n] * m.r;
-
-    const I = Math.max(JD[n].b.getInertia(), 1e-4);
-    const kd = m.damping * 2 * Math.sqrt(m.kp * I);
-    let tau = m.kp * (target - q) - kd * qd;
-    tau = Math.max(-m.max, Math.min(m.max, tau));
-    JD[n].b.applyTorque(tau, true);
-    JD[n].a.applyTorque(-tau, true);
+  const v = B.chest.getLinearVelocity();
+  const cp = B.chest.getPosition();
+  o.push(a / Math.PI, B.chest.getAngularVelocity() / 10, v.x / 2, v.y / 2, (cp.y - H0) / 1.5);
+  for (const l of LIMBS) {
+    const p = footTip(l);
+    o.push(grips[l] ? 1 : 0, (p.x - cp.x) / 0.4, (p.y - cp.y) / 0.4);
   }
+  o.push(Math.sin((2 * Math.PI * simT) / GAIT_T), Math.cos((2 * Math.PI * simT) / GAIT_T));
+  return o;
 }
 
 // ---------- Interface appelée depuis Python ----------
@@ -153,80 +226,182 @@ window.sim = {
   },
   step(json) {
     const a = JSON.parse(json);
-    ACT.forEach((n, i) => { targets[n] = Math.max(-1, Math.min(1, a[i])); });
-    for (let i = 0; i < SUBSTEPS; i++) {
-      applyTorques();
-      world.step(DT, 8, 3);
-    }
-    return JSON.stringify({ obs: observe(), dx: B.pelvis.getPosition().x - X0, fallen: isFallen() });
+    CTRL.forEach((n, i) => { targets[n] = clamp(a[i], -1, 1); });
+    const gcmd = {};
+    LIMBS.forEach((l, i) => { gcmd[l] = a[CTRL.length + i]; });
+    updateGrips(gcmd);
+    setMotors();
+    for (let i = 0; i < SUBSTEPS; i++) world.step(DT, 8, 3);
+    simT += 1 / 60;
+    const y = B.chest.getPosition().y;
+    noGripT = gripCount() === 0 ? noGripT + 1 / 60 : 0;
+    return JSON.stringify({
+      obs: observe(),
+      y: y,
+      grips: LIMBS.map((l) => (grips[l] ? 1 : 0)),
+      fallen: y < FALL_Y || noGripT > 0.6,
+      success: y >= GOAL_Y,
+    });
   },
 };
 
 window.waitFrame = () => new Promise((r) => requestAnimationFrame(r));
 window.setStats = (txt) => { statsEl.textContent = txt; };
 
-// ---------- Rendu et caméra ----------
-function toScreen(x, y, camX) {
-  return { x: canvas.width / 2 + (x - camX) * PX, y: canvas.height - GROUND_PX - y * PX };
+let perfHistory = [];
+window.setHistory = (txt) => {
+  try { perfHistory = JSON.parse(txt); } catch (e) { perfHistory = []; }
+};
+
+// ---------- Rendu ----------
+const sx = (x) => canvas.width / 2 + x * PX;
+const sy = (y) => canvas.height * 0.6 - (y - camY) * PX;
+
+function drawTree() {
+  const x0 = sx(-TRUNK_HALF), x1 = sx(TRUNK_HALF);
+  const yTop = sy(TREE_TOP), yBot = sy(0);
+
+  const g = ctx.createLinearGradient(x0, 0, x1, 0);
+  g.addColorStop(0, "#5b3d22"); g.addColorStop(0.5, "#7a5232"); g.addColorStop(1, "#4e331c");
+  ctx.fillStyle = g;
+  ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+
+  // sillons d'écorce
+  ctx.strokeStyle = "rgba(30,18,8,0.35)";
+  ctx.lineWidth = 2;
+  const ys = Math.max(yTop, -20), ye = Math.min(yBot, canvas.height + 20);
+  for (let i = 0; i < 9; i++) {
+    const x = x0 + ((i + 0.5) * (x1 - x0)) / 9 + Math.sin(i * 7.1) * 6;
+    ctx.beginPath();
+    for (let y = ys; y <= ye; y += 30) {
+      const wob = Math.sin(y * 0.02 + i) * 4;
+      if (y === ys) ctx.moveTo(x + wob, y); else ctx.lineTo(x + wob, y);
+    }
+    ctx.stroke();
+  }
+
+  // repères d'altitude
+  ctx.font = "11px sans-serif";
+  for (let h = 0.5; h < TREE_TOP; h += 0.5) {
+    const y = sy(h);
+    if (y < -10 || y > canvas.height + 10) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.4)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + 16, y); ctx.stroke();
+    ctx.fillStyle = "#333";
+    ctx.fillText(h.toFixed(1) + " m", x0 - 40, y + 4);
+  }
+
+  // ligne d'arrivée
+  const yg = sy(GOAL_Y);
+  ctx.setLineDash([8, 6]);
+  ctx.strokeStyle = "#ffd54a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x0 - 20, yg); ctx.lineTo(x1 + 20, yg); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#7a5a00";
+  ctx.fillText("SOMMET", x1 + 24, yg + 4);
+
+  // feuillage
+  ctx.fillStyle = "#2f6b2a";
+  ctx.beginPath(); ctx.ellipse(canvas.width / 2, yTop, 280, 90, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = "#3f8a37";
+  ctx.beginPath(); ctx.ellipse(canvas.width / 2 - 60, yTop - 30, 180, 60, 0, 0, 6.283); ctx.fill();
 }
 
-// Dessine un membre comme une capsule arrondie avec un dégradé, pour un rendu plus organique
-// qu'un simple trait.
-function drawLimb(name, camX) {
+function drawCapsule(name, fill) {
   const b = B[name];
   const [hx, hy] = DIMS[name];
   const p = b.getPosition(), a = b.getAngle();
   const dx = Math.cos(a) * hx, dy = Math.sin(a) * hx;
-  const A = toScreen(p.x - dx, p.y - dy, camX);
-  const Z = toScreen(p.x + dx, p.y + dy, camX);
-  const width = hy * 2 * PX;
-
-  const grad = ctx.createLinearGradient(A.x, A.y - width / 2, A.x, A.y + width / 2);
-  grad.addColorStop(0, "#f3c9a0");
-  grad.addColorStop(0.5, "#e0a878");
-  grad.addColorStop(1, "#c98a5c");
-
-  ctx.strokeStyle = grad;
-  ctx.lineWidth = width;
+  const x1 = sx(p.x - dx), y1 = sy(p.y - dy), x2 = sx(p.x + dx), y2 = sy(p.y + dy);
   ctx.lineCap = "round";
-  ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(Z.x, Z.y); ctx.stroke();
+  ctx.strokeStyle = "#2f4a1c";                 // contour
+  ctx.lineWidth = hy * 2 * PX + 3;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.strokeStyle = fill;                      // peau
+  ctx.lineWidth = hy * 2 * PX;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
 
-  // léger contour pour détacher le membre du fond
-  ctx.strokeStyle = "rgba(90,55,30,0.35)";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(Z.x, Z.y); ctx.stroke();
+function drawLizard() {
+  for (const n of ["tail3", "tail2", "tail1"]) drawCapsule(n, "#5d8a30");
+  // pattes de droite d'abord (plus sombres), puis celles de gauche
+  for (const l of ["RR", "FR"]) { drawCapsule("up" + l, "#527c2b"); drawCapsule("low" + l, "#527c2b"); }
+  for (const l of ["RL", "FL"]) { drawCapsule("up" + l, "#6b9b37"); drawCapsule("low" + l, "#6b9b37"); }
+  drawCapsule("pelvis", "#6b9b37");
+  drawCapsule("chest", "#76a83d");
+
+  // tête
+  const h = B.chest.getWorldPoint(V(0.17, 0));
+  ctx.fillStyle = "#2f4a1c";
+  ctx.beginPath(); ctx.arc(sx(h.x), sy(h.y), 0.06 * PX + 1.5, 0, 6.283); ctx.fill();
+  ctx.fillStyle = "#76a83d";
+  ctx.beginPath(); ctx.arc(sx(h.x), sy(h.y), 0.06 * PX, 0, 6.283); ctx.fill();
+  for (const s of [-1, 1]) {
+    const e = B.chest.getWorldPoint(V(0.185, s * 0.03));
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(sx(e.x), sy(e.y), 4, 0, 6.283); ctx.fill();
+    ctx.fillStyle = "#111";
+    ctx.beginPath(); ctx.arc(sx(e.x), sy(e.y), 2, 0, 6.283); ctx.fill();
+  }
+
+  // griffes : dorées quand elles sont plantées dans le tronc
+  for (const l of LIMBS) {
+    const p = footTip(l);
+    ctx.beginPath();
+    if (grips[l]) {
+      ctx.fillStyle = "#ffcc33"; ctx.strokeStyle = "#a05a00"; ctx.lineWidth = 2;
+      ctx.arc(sx(p.x), sy(p.y), 8, 0, 6.283); ctx.fill(); ctx.stroke();
+    } else {
+      ctx.fillStyle = "#3d5a20";
+      ctx.arc(sx(p.x), sy(p.y), 5, 0, 6.283); ctx.fill();
+    }
+  }
+}
+
+function drawChart() {
+  const w = 270, h = 120, x = canvas.width - w - 12, y = 12;
+  ctx.fillStyle = "rgba(20,20,35,0.78)";
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = "#fff";
+  ctx.font = "11px sans-serif";
+  ctx.fillText("Progrès : hauteur gagnée par génération (m)", x + 8, y + 15);
+  if (perfHistory.length < 2) {
+    ctx.fillStyle = "#aaa";
+    ctx.fillText("en attente de la 2e génération…", x + 8, y + 60);
+    return;
+  }
+  const maxV = Math.max(1.5, ...perfHistory.map((p) => p[0]));
+  const n = perfHistory.length;
+  const px0 = x + 10, py0 = y + h - 12, pw = w - 20, ph = h - 40;
+  const line = (idx, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    perfHistory.forEach((p, i) => {
+      const X = px0 + (i / (n - 1)) * pw, Y = py0 - (p[idx] / maxV) * ph;
+      if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+  };
+  line(1, "#6EC1FF");
+  line(0, "#7CFC9A");
+  ctx.fillStyle = "#7CFC9A"; ctx.fillText("meilleur", x + 150, y + 15 + 0);
+  ctx.fillStyle = "#6EC1FF"; ctx.fillText("moyenne", x + 205, y + 15 + 0);
 }
 
 function draw() {
+  const target = B.chest.getPosition().y + 0.25;
+  if (camY === null) camY = target;
+  camY += (target - camY) * 0.12;
+
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const y0 = canvas.height - GROUND_PX;
-  ctx.fillStyle = "#5a7d3a";
-  ctx.fillRect(0, y0, canvas.width, GROUND_PX);
-  const camX = B.pelvis.getPosition().x;
-
-  // membres, tronc (bassin + poitrine) dessiné en dernier pour recouvrir les attaches
-  const order = Object.keys(DIMS).filter((n) => n !== "pelvis" && n !== "chest");
-  for (const n of order) drawLimb(n, camX);
-  drawLimb("pelvis", camX);
-  drawLimb("chest", camX);
-
-  // articulations : petits ronds discrets de la même teinte, pas de points rouges
-  ctx.fillStyle = "#e0a878";
-  for (const n of Object.keys(JD)) {
-    const j = J[n];
-    const anchor = j.getAnchorA();
-    const pt = toScreen(anchor.x, anchor.y, camX);
-    ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, 6.283); ctx.fill();
+  drawTree();
+  const yg = sy(0);
+  if (yg < canvas.height) {
+    ctx.fillStyle = "#5a7d3a";
+    ctx.fillRect(0, yg, canvas.width, canvas.height - yg);
   }
-
-  // tête
-  const hp = B.head.getPosition();
-  const H = toScreen(hp.x, hp.y, camX);
-  const headGrad = ctx.createRadialGradient(H.x - 4, H.y - 4, 2, H.x, H.y, HEAD_R * K * PX);
-  headGrad.addColorStop(0, "#f3c9a0");
-  headGrad.addColorStop(1, "#d89b6c");
-  ctx.fillStyle = headGrad;
-  ctx.beginPath(); ctx.arc(H.x, H.y, HEAD_R * K * PX, 0, 6.283); ctx.fill();
+  drawLizard();
+  drawChart();
 }
 
 function renderLoop() { draw(); requestAnimationFrame(renderLoop); }

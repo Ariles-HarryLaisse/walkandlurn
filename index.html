@@ -19,7 +19,10 @@
   <button id="btnReset">Réinitialiser</button>
   <button id="btnSave">Sauvegarder</button>
   <button id="btnLoad">Charger</button>
-  <label>Vitesse <input type="range" id="speed" min="1" max="40" value="1"></label>
+  <label>Vitesse <input type="range" id="speed" min="1" max="100" value="1">
+    <span id="speedLabel">×1</span></label>
+  <label title="Simule les essais d'un seul bloc, sans attendre l'affichage : le plus rapide possible">
+    <input type="checkbox" id="turbo"> Turbo</label>
   <span id="status">Chargement de la physique…</span>
 </div>
 <div id="stats">En attente…</div>
@@ -34,7 +37,11 @@ const statusEl = document.getElementById("status");
 document.getElementById("btnPause").onclick = () => { ui.paused = true; };
 document.getElementById("btnResume").onclick = () => { ui.paused = false; };
 document.getElementById("btnReset").onclick = () => { ui.reset = true; };
-document.getElementById("speed").oninput = (e) => { ui.speed = Number(e.target.value); };
+document.getElementById("speed").oninput = (e) => {
+  ui.speed = Number(e.target.value);
+  document.getElementById("speedLabel").textContent = "×" + e.target.value;
+};
+document.getElementById("turbo").onchange = (e) => { ui.turbo = e.target.checked; };
 document.getElementById("btnSave").onclick = () => { window.requestSave = true; };
 document.getElementById("btnLoad").onclick = () => { window.requestLoad = true; };
 

@@ -9,7 +9,7 @@ const canvas = document.getElementById("cv");
 const ctx = canvas.getContext("2d");
 const statsEl = document.getElementById("stats");
 
-const ui = { paused: false, reset: false, speed: 1 };
+const ui = { paused: false, reset: false, speed: 1, turbo: false };
 window.ui = ui;
 
 function resize() { canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
@@ -218,31 +218,93 @@ function observe() {
   return o;
 }
 
-// ---------- Interface appelée depuis Python ----------
+// ---------- Un pas de simulation (commun au mode normal et au mode turbo) ----------
+function stepCore(a) {
+  CTRL.forEach((n, i) => { targets[n] = clamp(a[i], -1, 1); });
+  const gcmd = {};
+  LIMBS.forEach((l, i) => { gcmd[l] = a[CTRL.length + i]; });
+  updateGrips(gcmd);
+  setMotors();
+  for (let i = 0; i < SUBSTEPS; i++) world.step(DT, 8, 3);
+  simT += 1 / 60;
+  const y = B.chest.getPosition().y;
+  noGripT = gripCount() === 0 ? noGripT + 1 / 60 : 0;
+  return {
+    obs: observe(),
+    y: y,
+    grips: LIMBS.map((l) => (grips[l] ? 1 : 0)),
+    fallen: y < FALL_Y || noGripT > 0.6,
+    success: y >= GOAL_Y,
+  };
+}
+
+// ---------- Interface appelée depuis Python (mode normal : un pas à la fois) ----------
 window.sim = {
   reset() {
     build();
     return JSON.stringify(observe());
   },
   step(json) {
-    const a = JSON.parse(json);
-    CTRL.forEach((n, i) => { targets[n] = clamp(a[i], -1, 1); });
-    const gcmd = {};
-    LIMBS.forEach((l, i) => { gcmd[l] = a[CTRL.length + i]; });
-    updateGrips(gcmd);
-    setMotors();
-    for (let i = 0; i < SUBSTEPS; i++) world.step(DT, 8, 3);
-    simT += 1 / 60;
-    const y = B.chest.getPosition().y;
-    noGripT = gripCount() === 0 ? noGripT + 1 / 60 : 0;
-    return JSON.stringify({
-      obs: observe(),
-      y: y,
-      grips: LIMBS.map((l) => (grips[l] ? 1 : 0)),
-      fallen: y < FALL_Y || noGripT > 0.6,
-      success: y >= GOAL_Y,
-    });
+    return JSON.stringify(stepCore(JSON.parse(json)));
   },
+};
+
+// ---------- Mode turbo : un essai complet simulé d'un seul bloc ----------
+// Le réseau de neurones est recalculé ici (mêmes poids que Python), ce qui évite un
+// aller-retour Python à chaque pas. Le travail est découpé en tranches de ~20 ms pour que
+// la page reste réactive (boutons, graphique, affichage échantillonné du lézard).
+const _mc = new MessageChannel();
+let _mcResolve = null;
+_mc.port1.onmessage = () => { const r = _mcResolve; _mcResolve = null; if (r) r(); };
+const yieldNow = () => new Promise((r) => { _mcResolve = r; _mc.port2.postMessage(0); });
+
+window.fastEpisode = async function (thetaJson, nObs, nHid, nAct, maxSteps, stagnation) {
+  const th = JSON.parse(thetaJson);
+  let i = 0;
+  const W1 = th.slice(i, i + nObs * nHid); i += nObs * nHid;
+  const b1 = th.slice(i, i + nHid); i += nHid;
+  const W2 = th.slice(i, i + nHid * nAct); i += nHid * nAct;
+  const b2 = th.slice(i, i + nAct);
+  const hid = new Array(nHid), act = new Array(nAct);
+  const policy = (obs) => {
+    for (let j = 0; j < nHid; j++) {
+      let s = b1[j];
+      for (let k = 0; k < nObs; k++) s += obs[k] * W1[k * nHid + j];
+      hid[j] = Math.tanh(s);
+    }
+    for (let j = 0; j < nAct; j++) {
+      let s = b2[j];
+      for (let k = 0; k < nHid; k++) s += hid[k] * W2[k * nAct + j];
+      act[j] = Math.tanh(s);
+    }
+    return act;
+  };
+
+  build();
+  let obs = observe();
+  let steps = 0, maxY = H0, tImprove = 0, stab = 0, fell = false, success = false;
+  let lastGrips = [1, 1, 1, 1];
+  const t0 = performance.now();
+  let sliceStart = t0;
+  while (steps < maxSteps) {
+    while (ui.paused && !ui.reset) await window.waitFrame();
+    if (ui.reset) return JSON.stringify({ aborted: true });
+    const r = stepCore(policy(obs));
+    obs = r.obs;
+    lastGrips = r.grips;
+    steps++;
+    const t = steps / 60;
+    if (r.y > maxY + 0.01) { maxY = r.y; tImprove = t; }
+    if (r.grips[0] + r.grips[1] + r.grips[2] + r.grips[3] >= 3) stab += 1 / 60;
+    if (r.fallen) { fell = true; break; }
+    if (r.success) { success = true; break; }
+    if (t - tImprove > stagnation) break;
+    if (performance.now() - sliceStart > 20) { await yieldNow(); sliceStart = performance.now(); }
+  }
+  return JSON.stringify({
+    aborted: false, steps: steps, maxY: maxY, stab: stab, fell: fell, success: success,
+    grips: lastGrips, ms: performance.now() - t0,
+  });
 };
 
 window.waitFrame = () => new Promise((r) => requestAnimationFrame(r));

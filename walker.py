@@ -13,6 +13,7 @@
 import js
 import json
 import asyncio
+import time
 import numpy as np
 
 # Tailles lues dans physics.js : jamais de décalage entre corps et réseau
@@ -59,18 +60,40 @@ def fresh_theta():
     return th
 
 
-async def pace(k):
-    """Respecte pause / réinitialisation / vitesse choisies dans l'interface."""
+_meas = {"t": time.perf_counter(), "n": 0, "x": 1.0, "yield": time.perf_counter()}
+
+
+def count_steps(n):
+    """Mesure la vitesse réellement obtenue (en multiples du temps réel)."""
+    _meas["n"] += n
+    now = time.perf_counter()
+    dt = now - _meas["t"]
+    if dt >= 1.0:
+        _meas["x"] = _meas["n"] / 60.0 / dt
+        _meas["t"] = now
+        _meas["n"] = 0
+
+
+async def wait_unpaused():
     ui = js.window.ui
     while True:
         if ui.reset:
             ui.reset = False
             raise Reset()
         if not ui.paused:
-            break
+            return
         await js.window.waitFrame()
-    if k % max(1, int(ui.speed)) == 0:
+
+
+async def pace(k):
+    """Pause / réinitialisation / vitesse. On cède la main au navigateur toutes les
+    `speed` étapes, ou plus tôt si le calcul dure plus de 14 ms (pour garder la page fluide)."""
+    await wait_unpaused()
+    speed = max(1, int(js.window.ui.speed))
+    now = time.perf_counter()
+    if k % speed == 0 or now - _meas["yield"] > 0.014:
         await js.window.waitFrame()
+        _meas["yield"] = time.perf_counter()
 
 
 class Learner:
@@ -130,7 +153,7 @@ def publish(L, live=None):
     js.window.setStats(
         f"Génération {L.gen} · Tentatives {L.attempts} · Hauteur {gain:.2f} m · "
         f"Chutes {L.falls} · Record {L.best_gain:.2f} m · "
-        f"Prises (AG AD RG RD) {gs} · Niveau {level(L)}"
+        f"Prises (AG AD RG RD) {gs} · Vitesse réelle ×{_meas['x']:.0f} · Niveau {level(L)}"
     )
 
 
@@ -138,7 +161,34 @@ def push_history(L):
     js.window.setHistory(json.dumps(L.history))
 
 
+def finish(L, max_y, stab, steps, fell, success, grips):
+    """Calcule la récompense d'un essai (commun au mode normal et au mode turbo)."""
+    gain = max(0.0, max_y - H0)
+    t = steps / 60
+    reward = 15.0 * gain + 0.3 * stab + (20.0 if success else 0.0) - (3.0 if fell else 0.0)
+    L.last_gain = gain
+    L.last_grips = grips
+    return reward, gain, t, fell
+
+
+async def run_episode_fast(theta, L):
+    """Mode turbo : l'essai entier est simulé côté navigateur, sans aller-retour par pas."""
+    await wait_unpaused()
+    txt = await js.window.fastEpisode(
+        json.dumps(theta.tolist()), N_OBS, N_HID, N_ACT, MAX_STEPS, STAGNATION
+    )
+    r = json.loads(txt)
+    if r.get("aborted"):
+        await wait_unpaused()       # lève Reset si c'est la cause
+        return await run_episode_fast(theta, L)
+    _meas["n"] += r["steps"]
+    count_steps(0)
+    return finish(L, r["maxY"], r["stab"], r["steps"], r["fell"], r["success"], r["grips"])
+
+
 async def run_episode(theta, L):
+    if js.window.ui.turbo:
+        return await run_episode_fast(theta, L)
     obs = json.loads(js.window.sim.reset())
     steps = 0
     max_y = H0
@@ -155,6 +205,7 @@ async def run_episode(theta, L):
         y = res["y"]
         grips = res["grips"]
         steps += 1
+        count_steps(1)
         t = steps / 60
         if y > max_y + 0.01:
             max_y = y
@@ -171,12 +222,7 @@ async def run_episode(theta, L):
             break
         if t - t_improve > STAGNATION:
             break
-    gain = max(0.0, max_y - H0)
-    t = steps / 60
-    reward = 15.0 * gain + 0.3 * stab + (20.0 if success else 0.0) - (3.0 if fell else 0.0)
-    L.last_gain = gain
-    L.last_grips = grips
-    return reward, gain, t, fell
+    return finish(L, max_y, stab, steps, fell, success, grips)
 
 
 def save(L):

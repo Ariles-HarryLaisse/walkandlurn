@@ -8,7 +8,7 @@ const VER = new URL(self.location.href).searchParams.get("v") || "0";
 importScripts("physics.js?v=" + VER);
 
 let L = [];       // lézards de ce worker
-let OFF = 0;      // indice global du premier lézard
+let IDS = [];     // indice global de chacun de mes lézards (répartition en alternance)
 
 function snapshot() {
   const n = L.length;
@@ -25,7 +25,7 @@ function snapshot() {
   // actifs d'abord, puis du plus haut au plus bas
   cand.sort((a, b) => (L[b].finished ? 0 : 1) - (L[a].finished ? 0 : 1) || L[b].y - L[a].y);
   const top = cand.slice(0, 8).map((i) => ({
-    id: OFF + i, active: !L[i].finished, y: L[i].y, maxY: L[i].maxY,
+    id: IDS[i], active: !L[i].finished, y: L[i].y, maxY: L[i].maxY,
     pose: L[i].pose(), grips: L[i].gripsArr(), genes: L[i].genesArr,
   }));
   return { type: "snap", alive: alive, gains: gains, states: states, top: top };
@@ -36,7 +36,7 @@ self.onmessage = (e) => {
   try {
     if (m.type === "init") {
       if (typeof planck === "undefined") throw new Error("planck.js n'a pas été chargé dans le worker");
-      OFF = m.offset;
+      IDS = m.ids;
       L = [];
       const NG = BODY_KEYS.length;
       for (let i = 0; i < m.count; i++) {

@@ -15,8 +15,8 @@
 //    ses muscles doivent forcer, donc plus il consomme.
 // ============================================================
 
-const DT = 1 / 240;                 // pas de physique fixe
-const SUBSTEPS = 4;                 // pas physiques par tick (1 tick = 1/60 s)
+const SUBSTEPS = 2;                 // pas physiques par tick (1 tick = 1/60 s). 4 = plus précis, 2× plus lent
+const DT = 1 / (60 * SUBSTEPS);     // pas de physique fixe
 const V = (x, y) => planck.Vec2(x, y);
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const deg = (d) => (d * Math.PI) / 180;
@@ -27,6 +27,9 @@ const START_Y = 1.0;                // hauteur de la colonne vertébrale au dép
 const H0 = START_Y + 0.13;          // hauteur de départ du centre de la poitrine
 const FALL_Y = 0.75;                // sous cette hauteur : tombé
 const T_MAX = 120;                  // filet de sécurité (s) : un lézard ne vit pas plus longtemps
+const STAGNATION_T = 10;            // un lézard qui ne monte plus depuis 10 s est arrêté (0 = jamais).
+                                    // Son énergie est comptée comme entièrement consommée : il l'aurait
+                                    // brûlée de toute façon, et cela évite d'attendre son épuisement.
 
 // ---------- Griffes ----------
 const GRIP_BASE = 70;               // force de griffe (N) pour un squelette de masse ×1
@@ -180,16 +183,26 @@ function createLizard(brain, g) {
 
   // ----- griffes -----
   const footTip = (l) => B["low" + l].getWorldPoint(V(LL / 2, 0));
-  function attach(l, p) {
-    grips[l] = world.createJoint(planck.RevoluteJoint({ collideConnected: false }, B["low" + l], ground, p));
+  const tipX = new Float64Array(LIMBS.length), tipY = new Float64Array(LIMBS.length);
+  const computeTips = () => {          // positions des griffes, calculées une seule fois par tick
+    for (let i = 0; i < LIMBS.length; i++) {
+      const q = B["low" + LIMBS[i]].getWorldPoint(V(LL / 2, 0));
+      tipX[i] = q.x; tipY[i] = q.y;
+    }
+  };
+  let nGrips = 0;
+  function attach(l, pt) {
+    grips[l] = world.createJoint(planck.RevoluteJoint({ collideConnected: false }, B["low" + l], ground, pt));
     gripTimer[l] = 0;
+    nGrips++;
   }
   function release(l) {
-    if (grips[l]) { world.destroyJoint(grips[l]); grips[l] = null; }
+    if (grips[l]) { world.destroyJoint(grips[l]); grips[l] = null; nGrips--; }
     gripTimer[l] = 0;
   }
   function updateGrips() {
-    for (const l of LIMBS) {
+    for (let i = 0; i < LIMBS.length; i++) {
+      const l = LIMBS[i];
       gripTimer[l] += 1 / 60;
       const want = gcmd[l] > 0;
       const gj = grips[l];
@@ -198,99 +211,117 @@ function createLizard(brain, g) {
         if (Math.hypot(f.x, f.y) > gripMax) { release(l); continue; }          // la griffe glisse
         if (!want && gripTimer[l] > MIN_HOLD) release(l);
       } else if (want && gripTimer[l] > MIN_HOLD) {
-        const p = footTip(l);
-        if (Math.abs(p.x) < TRUNK_HALF && p.y > 0.04) attach(l, p);            // pas de limite en hauteur
+        if (Math.abs(tipX[i]) < TRUNK_HALF && tipY[i] > 0.04) attach(l, V(tipX[i], tipY[i]));   // pas de limite en hauteur
       }
     }
   }
   for (const l of LIMBS) { grips[l] = null; gripTimer[l] = 1; attach(l, footTip(l)); }
-  const gripCount = () => LIMBS.filter((l) => grips[l]).length;
+  const gripCount = () => nGrips;
 
-  // ----- muscles -----
+  // ----- muscles (tableaux pré-calculés : pas de recherche par nom à chaque tick) -----
+  const CJ = CTRL.map((n) => J[n]);
+  const CSIGN = CTRL.map(signOf);
+  const CPAR = CTRL.map((n) => JT[typeOf(n)]);
+  const sm = new Float64Array(CTRL.length), tg = new Float64Array(CTRL.length);
+  const tail2 = J.tail2, tail3 = J.tail3;
   function setMotors() {
     const alpha = 1 / 60 / (1 / 60 + SMOOTH_TAU);
-    for (const n of CTRL) {
-      smoothed[n] += ((targets[n] || 0) - smoothed[n]) * alpha;
-      const m = JT[typeOf(n)];
-      const tgt = signOf(n) * m.r * smoothed[n];
-      J[n].setMotorSpeed(clamp(m.gain * (tgt - J[n].getJointAngle()), -m.vmax, m.vmax));
+    for (let i = 0; i < CJ.length; i++) {
+      sm[i] += (tg[i] - sm[i]) * alpha;
+      const m = CPAR[i];
+      CJ[i].setMotorSpeed(clamp(m.gain * (CSIGN[i] * m.r * sm[i] - CJ[i].getJointAngle()), -m.vmax, m.vmax));
     }
-    for (const n of ["tail2", "tail3"]) {
-      const m = JT.tailp;
-      J[n].setMotorSpeed(clamp(m.gain * (0 - J[n].getJointAngle()), -m.vmax, m.vmax));
-    }
+    const m = JT.tailp;
+    tail2.setMotorSpeed(clamp(m.gain * (0 - tail2.getJointAngle()), -m.vmax, m.vmax));
+    tail3.setMotorSpeed(clamp(m.gain * (0 - tail3.getJointAngle()), -m.vmax, m.vmax));
   }
 
-  // ----- cerveau : réseau de neurones à une couche cachée -----
+  // ----- cerveau : réseau de neurones à une couche cachée (accès mémoire séquentiels) -----
   const W1 = brain.subarray(0, N_OBS * NH);
   const b1 = brain.subarray(N_OBS * NH, N_OBS * NH + NH);
   const W2 = brain.subarray(N_OBS * NH + NH, N_OBS * NH + NH + NH * N_ACT);
   const b2 = brain.subarray(N_OBS * NH + NH + NH * N_ACT);
   const hid = new Float64Array(NH), act = new Float64Array(N_ACT);
   function policy(obs) {
-    for (let j = 0; j < NH; j++) {
-      let s = b1[j];
-      for (let k = 0; k < N_OBS; k++) s += obs[k] * W1[k * NH + j];
-      hid[j] = Math.tanh(s);
+    for (let j = 0; j < NH; j++) hid[j] = b1[j];
+    for (let k = 0; k < N_OBS; k++) {
+      const o = obs[k];
+      if (o === 0) continue;
+      const base = k * NH;
+      for (let j = 0; j < NH; j++) hid[j] += o * W1[base + j];
+    }
+    for (let j = 0; j < NH; j++) hid[j] = Math.tanh(hid[j]);
+    for (let j = 0; j < N_ACT; j++) act[j] = b2[j];
+    for (let k = 0; k < NH; k++) {
+      const h = hid[k], base = k * N_ACT;
+      for (let j = 0; j < N_ACT; j++) act[j] += h * W2[base + j];
     }
     for (let j = 0; j < N_ACT; j++) {
-      let s = b2[j];
-      for (let k = 0; k < NH; k++) s += hid[k] * W2[k * N_ACT + j];
-      const v = Math.tanh(s);
+      const v = Math.tanh(act[j]);
       act[j] = Number.isFinite(v) ? v : 0;
     }
     return act;
   }
 
   const lz = {
-    finished: false, cause: 0,          // cause : 0 actif, 1 à court d'énergie, 2 tombé, 3 temps maximal
+    finished: false, cause: 0,          // cause : 0 actif, 1 à court d'énergie, 2 tombé, 3 inactif / temps maximal
     t: 0, y: H0, maxY: H0, energy: E0, energyUsed: 0,
     mass: 0, genesArr: BODY_KEYS.map((k) => g[k]),
   };
   lz.mass = totalMass;
+  let markY = H0, markT = 0;            // dernier progrès notable en hauteur
 
-  // ----- ce que le lézard perçoit -----
+  // ----- ce que le lézard perçoit (tableau réutilisé, aucune allocation) -----
+  const obsArr = new Array(N_OBS).fill(0);
   function observe() {
-    const o = [];
-    for (const n of CTRL) {
-      const s = signOf(n);
-      o.push((s * J[n].getJointAngle()) / Math.PI, (s * J[n].getJointSpeed()) / 10);
+    let k = 0;
+    for (let i = 0; i < CJ.length; i++) {
+      obsArr[k++] = (CSIGN[i] * CJ[i].getJointAngle()) / Math.PI;
+      obsArr[k++] = (CSIGN[i] * CJ[i].getJointSpeed()) / 10;
     }
     let a = B.chest.getAngle() - Math.PI / 2;
     a = Math.atan2(Math.sin(a), Math.cos(a));
     const v = B.chest.getLinearVelocity();
     const cp = B.chest.getPosition();
-    o.push(a / Math.PI, B.chest.getAngularVelocity() / 10, v.x / 2, v.y / 2, clamp((cp.y - H0) / 1.5, -2, 2));
-    o.push(clamp(lz.energy / E0, 0, 1));
-    for (const l of LIMBS) {
-      const p = footTip(l);
-      o.push(grips[l] ? 1 : 0, (p.x - cp.x) / 0.4, (p.y - cp.y) / 0.4);
+    obsArr[k++] = a / Math.PI;
+    obsArr[k++] = B.chest.getAngularVelocity() / 10;
+    obsArr[k++] = v.x / 2;
+    obsArr[k++] = v.y / 2;
+    obsArr[k++] = clamp((cp.y - H0) / 1.5, -2, 2);
+    obsArr[k++] = clamp(lz.energy / E0, 0, 1);
+    for (let i = 0; i < LIMBS.length; i++) {
+      obsArr[k++] = grips[LIMBS[i]] ? 1 : 0;
+      obsArr[k++] = (tipX[i] - cp.x) / 0.4;
+      obsArr[k++] = (tipY[i] - cp.y) / 0.4;
     }
-    o.push(Math.sin((2 * Math.PI * lz.t) / GAIT_T), Math.cos((2 * Math.PI * lz.t) / GAIT_T));
-    return o;
+    obsArr[k++] = Math.sin((2 * Math.PI * lz.t) / GAIT_T);
+    obsArr[k++] = Math.cos((2 * Math.PI * lz.t) / GAIT_T);
+    return obsArr;
   }
 
   // ----- un tick = 1/60 s -----
   lz.step = function () {
     if (lz.finished) return;
+    computeTips();
     const a = policy(observe());
-    for (let i = 0; i < CTRL.length; i++) targets[CTRL[i]] = clamp(a[i], -1, 1);
+    for (let i = 0; i < CTRL.length; i++) tg[i] = clamp(a[i], -1, 1);
     for (let i = 0; i < LIMBS.length; i++) gcmd[LIMBS[i]] = a[CTRL.length + i];
     updateGrips();
     setMotors();
-    for (let i = 0; i < SUBSTEPS; i++) world.step(DT, 8, 3);
+    for (let i = 0; i < SUBSTEPS; i++) world.step(DT, 6, 2);
     lz.t += 1 / 60;
 
     const y = B.chest.getPosition().y;
     if (!Number.isFinite(y)) { lz.finished = true; lz.cause = 2; return; }
     lz.y = y;
     if (y > lz.maxY) lz.maxY = y;
+    if (y > markY + 0.02) { markY = y; markT = lz.t; }
     noGripT = gripCount() === 0 ? noGripT + 1 / 60 : 0;
 
     // consommation d'énergie de ce tick
     let P = basal;
-    for (const n of CTRL) {
-      const j = J[n];
+    for (let i = 0; i < CJ.length; i++) {
+      const j = CJ[i];
       const tq = j.getMotorTorque ? j.getMotorTorque(1 / DT) : 0;
       if (!Number.isFinite(tq)) continue;
       const pw = tq * j.getJointSpeed();
@@ -301,7 +332,8 @@ function createLizard(brain, g) {
 
     if (y < FALL_Y || noGripT > 0.6) { lz.finished = true; lz.cause = 2; }
     else if (lz.energy <= 0) { lz.finished = true; lz.cause = 1; lz.energyUsed = E0; }
-    else if (lz.t >= T_MAX) { lz.finished = true; lz.cause = 3; }
+    else if (STAGNATION_T > 0 && lz.t - markT > STAGNATION_T) { lz.finished = true; lz.cause = 3; lz.energyUsed = E0; }
+    else if (lz.t >= T_MAX) { lz.finished = true; lz.cause = 3; lz.energyUsed = E0; }
   };
 
   // ----- données pour l'affichage -----

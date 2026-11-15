@@ -3,7 +3,7 @@
 #
 # Chaque génération : 1000 lézards grimpent en même temps, simulés en parallèle par des
 # Workers (voir view.js / worker.js). La génération s'arrête quand le DERNIER lézard est
-# à court d'énergie (ou tombé). Ensuite :
+# à court d'énergie (ou tombé, ou arrêté après 10 s sans progrès). Ensuite :
 #   1. on classe les lézards par hauteur maximale atteinte (au centimètre près) ;
 #      à égalité, celui qui a consommé le moins d'énergie passe devant ;
 #   2. les 500 premiers survivent et créent chacun une copie identique ;
@@ -33,6 +33,9 @@ P_MUT_WEIGHT = 0.01         # probabilité qu'un poids du cerveau mute dans une 
 SIGMA_WEIGHT = 0.25         # amplitude d'une mutation de poids
 P_MUT_GENE = 0.05           # probabilité qu'un gène du corps (masse, muscle, énergie) mute
 SIGMA_GENE = 0.15           # amplitude d'une mutation de gène (variation relative, ~15 %)
+REPLAY_PARENTS = False      # False : les 500 parents ne sont PAS resimulés (leur résultat est identique,
+                            # la physique étant déterministe) -> génération 2× plus rapide.
+                            # True : tous les lézards rejouent à chaque génération.
 SAVE_TOP = 100              # nombre de lézards conservés dans la sauvegarde
 SAVE_KEY = "lizard_evo_save"
 
@@ -73,6 +76,7 @@ class Population:
         self.history = []                        # [meilleur, moyenne] de hauteur par génération
         self.last = None                         # statistiques de la dernière génération
         self.table = []                          # une ligne par génération, pour le panneau
+        self.fit = None                          # résultats déjà connus des parents (gain, énergie, masse)
 
 
 def level(best):
@@ -106,6 +110,7 @@ def push_panel(S):
     js.window.setPanel(json.dumps({
         "gen": S.gen, "level": level(S.best_ever), "best_ever": S.best_ever,
         "last": S.last, "rows": S.table[-8:], "pop": POP, "elite": ELITE,
+        "cached": ELITE if (S.fit is not None and not REPLAY_PARENTS) else 0,
     }))
 
 
@@ -114,7 +119,9 @@ def push_history(S):
 
 
 async def run_generation(S):
-    txt = await js.window.runGeneration(b64(S.brains), b64(S.genes), POP)
+    # Les parents ont déjà été évalués : à l'identique, ils referaient exactement la même chose.
+    k = ELITE if (S.fit is not None and not REPLAY_PARENTS) else 0
+    txt = await js.window.runGeneration(b64(S.brains[k:]), b64(S.genes[k:]), POP - k)
     r = json.loads(txt)
     if r.get("aborted"):
         raise Reset()
@@ -122,6 +129,10 @@ async def run_generation(S):
     gain = np.array(r["gain"], dtype=np.float64)
     energy = np.array(r["energy"], dtype=np.float64)
     mass = np.array(r["mass"], dtype=np.float64)
+    if k:
+        gain = np.concatenate([S.fit[0], gain])
+        energy = np.concatenate([S.fit[1], energy])
+        mass = np.concatenate([S.fit[2], mass])
 
     # Classement : hauteur au centimètre près (décroissante), puis énergie consommée (croissante)
     order = np.lexsort((energy, -np.round(gain, 2)))
@@ -142,6 +153,7 @@ async def run_generation(S):
     S.best_ever = max(S.best_ever, S.last["best"])
 
     # Les 500 survivants restent identiques ; chacun crée une copie qui peut muter
+    S.fit = (gain[surv], energy[surv], mass[surv])      # résultats des parents, réutilisés à la génération suivante
     S.brains = np.concatenate([parents_b, mutate_brains(parents_b)])
     S.genes = np.concatenate([parents_g, mutate_genes(parents_g)])
 

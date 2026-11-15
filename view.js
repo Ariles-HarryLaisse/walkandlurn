@@ -63,22 +63,24 @@ window.runGeneration = async function (brainsB64, genesB64, pop) {
   ensurePool();
   const NP = SIM_INFO.nParams, NG = SIM_INFO.bodyKeys.length;
   const brains = b64ToF32(brainsB64), genes = b64ToF32(genesB64);
+  // Répartition en alternance (lézard i -> worker i % W) : les meilleurs, regroupés dans la
+  // population, sont ainsi partagés entre tous les cœurs au lieu de saturer les mêmes.
   const W = Math.min(pool.length, pop);
-  const per = Math.ceil(pop / W);
   const jobs = [];
-  for (let w = 0, off = 0; w < W && off < pop; w++) {
-    const count = Math.min(per, pop - off);
-    jobs.push({
-      w: pool[w], off: off, count: count,
-      b: brains.slice(off * NP, (off + count) * NP),
-      g: genes.slice(off * NG, (off + count) * NG),
+  for (let w = 0; w < W; w++) {
+    const ids = [];
+    for (let i = w; i < pop; i += W) ids.push(i);
+    const b = new Float32Array(ids.length * NP), g = new Float32Array(ids.length * NG);
+    ids.forEach((id, r) => {
+      b.set(brains.subarray(id * NP, (id + 1) * NP), r * NP);
+      g.set(genes.subarray(id * NG, (id + 1) * NG), r * NG);
     });
-    off += count;
+    jobs.push({ w: pool[w], ids: ids, b: b, g: g });
   }
   view.pop = pop; view.alive = pop; view.simT = 0; view.top = [];
   view.gains = new Float32Array(pop); view.states = new Uint8Array(pop);
   await Promise.all(jobs.map((j) =>
-    ask(j.w, { type: "init", offset: j.off, count: j.count, brains: j.b, genes: j.g }, [j.b.buffer, j.g.buffer])));
+    ask(j.w, { type: "init", ids: j.ids, count: j.ids.length, brains: j.b, genes: j.g }, [j.b.buffer, j.g.buffer])));
 
   let turboN = 4, lastTs = performance.now();
   while (true) {
@@ -91,8 +93,8 @@ window.runGeneration = async function (brainsB64, genesB64, pop) {
 
     let alive = 0, cand = [];
     snaps.forEach((s, i) => {
-      view.gains.set(s.gains, jobs[i].off);
-      view.states.set(s.states, jobs[i].off);
+      const ids = jobs[i].ids;
+      for (let k = 0; k < ids.length; k++) { view.gains[ids[k]] = s.gains[k]; view.states[ids[k]] = s.states[k]; }
       alive += s.alive;
       cand = cand.concat(s.top);
     });
@@ -116,11 +118,14 @@ window.runGeneration = async function (brainsB64, genesB64, pop) {
   }
 
   const res = await Promise.all(jobs.map((j) => ask(j.w, { type: "collect" })));
-  const cat = (k) => [].concat(...res.map((r) => r[k]));
-  return JSON.stringify({
-    aborted: false, gain: cat("gain"), energy: cat("energy"), time: cat("time"),
-    cause: cat("cause"), mass: cat("mass"),
+  const out = { aborted: false, gain: [], energy: [], time: [], cause: [], mass: [] };
+  for (const k of ["gain", "energy", "time", "cause", "mass"]) out[k] = new Array(pop);
+  res.forEach((r, i) => {
+    const ids = jobs[i].ids;
+    for (const k of ["gain", "energy", "time", "cause", "mass"])
+      for (let q = 0; q < ids.length; q++) out[k][ids[q]] = r[k][q];
   });
+  return JSON.stringify(out);
 };
 
 // ============================================================
@@ -234,7 +239,7 @@ function drawAltimeter() {
   for (let i = 0; i < view.gains.length; i++) if (view.gains[i] > mx) mx = view.gains[i];
   mx *= 1.1;
   const H = bottom - top;
-  const colors = ["#7CFC9A", "#f5c542", "#e06666", "#9aa0a6"];   // actif, épuisé, tombé, temps écoulé
+  const colors = ["#7CFC9A", "#f5c542", "#e06666", "#9aa0a6"];   // actif, épuisé, tombé, inactif
   for (let i = 0; i < view.gains.length; i++) {
     ctx.fillStyle = colors[view.states[i]] || "#fff";
     const px = x + ((i * 0.61803) % 1) * (w - 3);
@@ -332,7 +337,8 @@ function updatePanel() {
   const pct = pop ? Math.round((100 * done) / pop) : 0;
   $("pGen").textContent = view.gen;
   $("pBar").style.width = pct + "%";
-  $("pProg").textContent = done + " / " + pop + " lézards éliminés (" + pct + " %) · temps simulé " + fmt(view.simT, 1) + " s";
+  const cached = panelData && panelData.cached ? " · +" + panelData.cached + " parents en cache" : "";
+  $("pProg").textContent = done + " / " + pop + " lézards éliminés (" + pct + " %) · temps simulé " + fmt(view.simT, 1) + " s" + cached;
   $("pActive").textContent = counts[0];
   $("pTired").textContent = counts[1];
   $("pFell").textContent = counts[2];
@@ -342,7 +348,7 @@ function updatePanel() {
 
   // classement en direct
   const idx = Array.from(view.gains.keys()).sort((a, b) => view.gains[b] - view.gains[a]).slice(0, 5);
-  const names = ["actif", "épuisé", "tombé", "temps écoulé"];
+  const names = ["actif", "épuisé", "tombé", "inactif"];
   $("pTop").innerHTML = idx.map((i, r) =>
     "<tr><td>" + (r + 1) + "</td><td>n° " + i + "</td><td>" + fmt(view.gains[i], 2) + " m</td><td>" + names[view.states[i]] + "</td></tr>"
   ).join("");

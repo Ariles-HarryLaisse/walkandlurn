@@ -2,14 +2,14 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>LEZARD AI – il apprend à grimper</title>
+<title>LEZARD AI – 1000 lézards apprennent à grimper</title>
 <style>
   body { font-family: sans-serif; margin: 0; background: #1e1e2e; color: #eee; }
   #bar { padding: 8px 12px; background: #2a2a3e; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   button { padding: 6px 12px; cursor: pointer; }
   #status { margin-left: auto; font-size: 14px; }
-  #stats { padding: 6px 12px; background: #242438; font-family: monospace; font-size: 13px; }
-  canvas { display: block; background: #cfe8ff; width: 100%; height: calc(100vh - 85px); }
+  #stats { padding: 6px 12px; background: #242438; font-family: monospace; font-size: 13px; min-height: 18px; }
+  canvas { display: block; background: #cfe8ff; width: 100%; height: calc(100vh - 100px); }
 </style>
 </head>
 <body>
@@ -21,16 +21,20 @@
   <button id="btnLoad">Charger</button>
   <label>Vitesse <input type="range" id="speed" min="1" max="100" value="1">
     <span id="speedLabel">×1</span></label>
-  <label title="Simule les essais d'un seul bloc, sans attendre l'affichage : le plus rapide possible">
+  <label title="Simule au maximum de la vitesse de votre machine">
     <input type="checkbox" id="turbo"> Turbo</label>
-  <span id="status">Chargement de la physique…</span>
+  <span id="status">Chargement…</span>
 </div>
 <div id="stats">En attente…</div>
 <canvas id="cv"></canvas>
 
-<script src="https://cdn.jsdelivr.net/npm/planck@1.0.0/dist/planck.min.js"></script>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
-<script>document.write('<script src="physics.js?v=' + Date.now() + '"><\/script>');</script>
+<script>
+  // Les scripts sont rechargés à chaque ouverture pour éviter d'utiliser une ancienne copie en cache
+  window.BUILD = Date.now();
+  document.write('<script src="physics.js?v=' + window.BUILD + '"><\/script>');
+  document.write('<script src="view.js?v=' + window.BUILD + '"><\/script>');
+</script>
 <script>
 const statusEl = document.getElementById("status");
 
@@ -49,9 +53,9 @@ async function startPython() {
   try {
     statusEl.textContent = "Chargement de Python et numpy…";
     const pyodide = await loadPyodide();
-    const code = await (await fetch("walker.py?v=" + Date.now())).text();
+    const code = await (await fetch("walker.py?v=" + window.BUILD)).text();
     await pyodide.loadPackagesFromImports(code);
-    statusEl.textContent = "Apprentissage en cours";
+    statusEl.textContent = "Évolution en cours";
     await pyodide.runPythonAsync(code);
   } catch (err) {
     statusEl.textContent = "ERREUR : " + err;
@@ -60,9 +64,7 @@ async function startPython() {
 }
 
 try {
-  if (typeof planck === "undefined") throw new Error("planck.js n'a pas été chargé");
-  initPhysics();
-  statusEl.textContent = "Physique prête";
+  if (typeof createLizard === "undefined") throw new Error("physics.js n'a pas été chargé");
   requestAnimationFrame(renderLoop);
   startPython();
 } catch (err) {

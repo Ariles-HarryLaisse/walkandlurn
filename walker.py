@@ -1,37 +1,40 @@
 # ============================================================
-# LEZARD AI — Apprentissage (Python, exécuté dans le navigateur via Pyodide)
-# Un réseau de neurones pilote 10 muscles et 4 griffes. Il est entraîné par
-# stratégies d'évolution : à chaque génération, 16 variantes (8 paires
-# symétriques) grimpent à l'arbre ; les meilleures orientent la suivante.
-# La physique est déléguée à physics.js (window.sim).
+# LEZARD AI — Évolution (Python, exécuté dans le navigateur via Pyodide)
 #
-# Aucune séquence de pattes n'est programmée. Seule une récompense de stabilité
-# (garder au moins 3 griffes plantées) pousse le lézard à ne bouger qu'une patte
-# à la fois : main, jambe, autre main, autre jambe... c'est à lui de le découvrir.
+# Chaque génération : 1000 lézards grimpent en même temps, simulés en parallèle par des
+# Workers (voir view.js / worker.js). La génération s'arrête quand le DERNIER lézard est
+# à court d'énergie (ou tombé). Ensuite :
+#   1. on classe les lézards par hauteur maximale atteinte (au centimètre près) ;
+#      à égalité, celui qui a consommé le moins d'énergie passe devant ;
+#   2. les 500 premiers survivent et créent chacun une copie identique ;
+#   3. chaque copie peut subir des mutations RARES : sur le cerveau (quelques poids),
+#      sur la masse du squelette, sur la force des muscles, sur la réserve d'énergie.
+# Les 500 autres disparaissent. Les 1000 lézards recommencent au pied de l'arbre.
 # ============================================================
 
 import js
 import json
+import base64
 import asyncio
-import time
 import numpy as np
 
-# Tailles lues dans physics.js : jamais de décalage entre corps et réseau
-N_OBS = int(js.window.simInfo.nObs)
-N_ACT = int(js.window.simInfo.nAct)
-H0 = float(js.window.simInfo.h0)   # hauteur de départ de la poitrine
-N_GRIP = 4                         # les 4 dernières sorties commandent les griffes
-N_HID = 20
-N_PARAMS = N_OBS * N_HID + N_HID + N_HID * N_ACT + N_ACT
+INFO = json.loads(js.window.simInfoJson)       # tailles lues dans physics.js : aucun décalage possible
+N_PARAMS = int(INFO["nParams"])
+N_GRIP = int(INFO["nGrip"])
+KEYS = INFO["bodyKeys"]
+N_GENES = len(KEYS)
+LO = np.array(INFO["lo"], dtype=np.float32)
+HI = np.array(INFO["hi"], dtype=np.float32)
 
-POP = 16                # variantes par génération (paires symétriques)
-SIGMA = 0.1             # amplitude des variations testées
-LR = 0.06               # vitesse d'apprentissage
-MAX_STEPS = 14 * 60     # durée maximale d'un essai : 14 s
-STAGNATION = 5.0        # sans progrès en hauteur pendant 5 s : l'essai s'arrête
-GOAL_GAIN = 1.5         # hauteur à gagner pour atteindre le sommet (m)
-
-SAVE_KEY = "lizard_ai_save"
+# ---------- Réglages de l'évolution ----------
+POP = 1000                  # nombre de lézards simultanés
+ELITE = POP // 2            # nombre de survivants (qui se copient)
+P_MUT_WEIGHT = 0.01         # probabilité qu'un poids du cerveau mute dans une copie
+SIGMA_WEIGHT = 0.25         # amplitude d'une mutation de poids
+P_MUT_GENE = 0.05           # probabilité qu'un gène du corps (masse, muscle, énergie) mute
+SIGMA_GENE = 0.15           # amplitude d'une mutation de gène (variation relative, ~15 %)
+SAVE_TOP = 100              # nombre de lézards conservés dans la sauvegarde
+SAVE_KEY = "lizard_evo_save"
 
 
 class Reset(Exception):
@@ -39,194 +42,115 @@ class Reset(Exception):
     pass
 
 
-def unpack(theta):
-    i = 0
-    W1 = theta[i:i + N_OBS * N_HID].reshape(N_OBS, N_HID); i += N_OBS * N_HID
-    b1 = theta[i:i + N_HID]; i += N_HID
-    W2 = theta[i:i + N_HID * N_ACT].reshape(N_HID, N_ACT); i += N_HID * N_ACT
-    b2 = theta[i:i + N_ACT]
-    return W1, b1, W2, b2
+def b64(arr):
+    return base64.b64encode(np.ascontiguousarray(arr, dtype=np.float32).tobytes()).decode("ascii")
 
 
-def policy(theta, obs):
-    W1, b1, W2, b2 = unpack(theta)
-    h = np.tanh(obs @ W1 + b1)
-    return np.tanh(h @ W2 + b2)
+def unb64(s, shape):
+    return np.frombuffer(base64.b64decode(s), dtype=np.float32).reshape(shape).copy()
 
 
-def fresh_theta():
-    th = np.random.randn(N_PARAMS) * 0.1
-    th[-N_GRIP:] = 1.5      # au départ, le lézard a tendance à s'agripper
-    return th
+# ---------- Mutations ----------
+def mutate_brains(b):
+    mask = np.random.rand(*b.shape) < P_MUT_WEIGHT
+    noise = np.random.randn(*b.shape).astype(np.float32) * SIGMA_WEIGHT
+    return (b + mask * noise).astype(np.float32)
 
 
-_meas = {"t": time.perf_counter(), "n": 0, "x": 1.0, "yield": time.perf_counter()}
+def mutate_genes(g):
+    mask = np.random.rand(*g.shape) < P_MUT_GENE
+    factor = np.exp(np.random.randn(*g.shape) * SIGMA_GENE).astype(np.float32)
+    return np.clip(np.where(mask, g * factor, g), LO, HI).astype(np.float32)
 
 
-def count_steps(n):
-    """Mesure la vitesse réellement obtenue (en multiples du temps réel)."""
-    _meas["n"] += n
-    now = time.perf_counter()
-    dt = now - _meas["t"]
-    if dt >= 1.0:
-        _meas["x"] = _meas["n"] / 60.0 / dt
-        _meas["t"] = now
-        _meas["n"] = 0
-
-
-async def wait_unpaused():
-    ui = js.window.ui
-    while True:
-        if ui.reset:
-            ui.reset = False
-            raise Reset()
-        if not ui.paused:
-            return
-        await js.window.waitFrame()
-
-
-async def pace(k):
-    """Pause / réinitialisation / vitesse. On cède la main au navigateur toutes les
-    `speed` étapes, ou plus tôt si le calcul dure plus de 14 ms (pour garder la page fluide)."""
-    await wait_unpaused()
-    speed = max(1, int(js.window.ui.speed))
-    now = time.perf_counter()
-    if k % speed == 0 or now - _meas["yield"] > 0.014:
-        await js.window.waitFrame()
-        _meas["yield"] = time.perf_counter()
-
-
-class Learner:
+class Population:
     def __init__(self):
-        self.theta = fresh_theta()
+        self.brains = (np.random.randn(POP, N_PARAMS) * 0.1).astype(np.float32)
+        self.brains[:, -N_GRIP:] = 1.5          # au départ, les lézards ont tendance à s'agripper
+        self.genes = np.ones((POP, N_GENES), dtype=np.float32)
         self.gen = 0
-        self.attempts = 0
-        self.falls = 0
-        self.best_gain = 0.0
-        self.best_alive = 0.0
-        self.last_gain = 0.0
-        self.last_grips = [1, 1, 1, 1]
-        self.history = []       # [meilleur, moyenne] de hauteur gagnée par génération
-
-    def to_dict(self):
-        return {
-            "theta": self.theta.tolist(),
-            "gen": self.gen,
-            "attempts": self.attempts,
-            "falls": self.falls,
-            "best_gain": self.best_gain,
-            "best_alive": self.best_alive,
-            "history": self.history,
-        }
-
-    @staticmethod
-    def from_dict(d):
-        theta = np.array(d["theta"], dtype=float)
-        if theta.shape[0] != N_PARAMS:
-            return Learner()    # sauvegarde d'un autre corps : on repart d'un réseau neuf
-        L = Learner()
-        L.theta = theta
-        L.gen = d.get("gen", 0)
-        L.attempts = d.get("attempts", 0)
-        L.falls = d.get("falls", 0)
-        L.best_gain = d.get("best_gain", 0.0)
-        L.best_alive = d.get("best_alive", 0.0)
-        L.history = d.get("history", [])
-        return L
+        self.best_ever = 0.0
+        self.history = []                        # [meilleur, moyenne] de hauteur par génération
+        self.last = None                         # statistiques de la dernière génération
 
 
-def level(L):
-    if L.best_gain >= GOAL_GAIN:
-        return "5 - atteint le sommet"
-    if L.best_gain >= 0.6:
-        return "4 - grimpe"
-    if L.best_gain >= 0.15:
-        return "3 - monte un peu"
-    if L.best_alive >= 4:
-        return "2 - tient accroché"
-    return "1 - tombe tout de suite"
+def level(best):
+    if best >= 10:
+        return "5 - grimpeurs experts"
+    if best >= 3:
+        return "4 - grimpent haut"
+    if best >= 1:
+        return "3 - grimpent"
+    if best >= 0.15:
+        return "2 - premières montées"
+    return "1 - s'accrochent à peine"
 
 
-def publish(L, live=None):
-    gain, grips = (live if live else (L.last_gain, L.last_grips))
-    gs = "".join("●" if g else "○" for g in grips)
-    js.window.setStats(
-        f"Génération {L.gen} · Tentatives {L.attempts} · Hauteur {gain:.2f} m · "
-        f"Chutes {L.falls} · Record {L.best_gain:.2f} m · "
-        f"Prises (AG AD RG RD) {gs} · Vitesse réelle ×{_meas['x']:.0f} · Niveau {level(L)}"
-    )
+def publish(S):
+    if S.last is None:
+        js.window.setStats(f"Génération {S.gen} · {POP} lézards prêts · Niveau {level(S.best_ever)}")
+    else:
+        s = S.last
+        js.window.setStats(
+            f"Génération {S.gen} · Record {S.best_ever:.2f} m · Meilleur de la génération {s['best']:.2f} m "
+            f"({s['energy']:.0f} J) · Moyenne {s['mean']:.2f} m · "
+            f"Survivants : masse ×{s['g_mass']:.2f}, muscles ×{s['g_musc']:.2f}, énergie ×{s['g_en']:.2f} "
+            f"· Poids moyen {s['kg']:.2f} kg · Niveau {level(S.best_ever)}"
+        )
+    js.window.setGen(S.gen)
 
 
-def push_history(L):
-    js.window.setHistory(json.dumps(L.history))
+def push_history(S):
+    js.window.setHistory(json.dumps(S.history))
 
 
-def finish(L, max_y, stab, steps, fell, success, grips):
-    """Calcule la récompense d'un essai (commun au mode normal et au mode turbo)."""
-    gain = max(0.0, max_y - H0)
-    t = steps / 60
-    reward = 15.0 * gain + 0.3 * stab + (20.0 if success else 0.0) - (3.0 if fell else 0.0)
-    L.last_gain = gain
-    L.last_grips = grips
-    return reward, gain, t, fell
-
-
-async def run_episode_fast(theta, L):
-    """Mode turbo : l'essai entier est simulé côté navigateur, sans aller-retour par pas."""
-    await wait_unpaused()
-    txt = await js.window.fastEpisode(
-        json.dumps(theta.tolist()), N_OBS, N_HID, N_ACT, MAX_STEPS, STAGNATION
-    )
+async def run_generation(S):
+    txt = await js.window.runGeneration(b64(S.brains), b64(S.genes), POP)
     r = json.loads(txt)
     if r.get("aborted"):
-        await wait_unpaused()       # lève Reset si c'est la cause
-        return await run_episode_fast(theta, L)
-    _meas["n"] += r["steps"]
-    count_steps(0)
-    return finish(L, r["maxY"], r["stab"], r["steps"], r["fell"], r["success"], r["grips"])
+        raise Reset()
+
+    gain = np.array(r["gain"], dtype=np.float64)
+    energy = np.array(r["energy"], dtype=np.float64)
+    mass = np.array(r["mass"], dtype=np.float64)
+
+    # Classement : hauteur au centimètre près (décroissante), puis énergie consommée (croissante)
+    order = np.lexsort((energy, -np.round(gain, 2)))
+    surv = order[:ELITE]
+
+    parents_b = S.brains[surv]
+    parents_g = S.genes[surv]
+    musc_cols = [i for i, k in enumerate(KEYS) if k not in ("mass", "energy")]
+    S.last = {
+        "best": float(gain[order[0]]),
+        "energy": float(energy[order[0]]),
+        "mean": float(gain.mean()),
+        "kg": float(mass[surv].mean()),
+        "g_mass": float(parents_g[:, KEYS.index("mass")].mean()),
+        "g_musc": float(parents_g[:, musc_cols].mean()),
+        "g_en": float(parents_g[:, KEYS.index("energy")].mean()),
+    }
+    S.best_ever = max(S.best_ever, S.last["best"])
+
+    # Les 500 survivants restent identiques ; chacun crée une copie qui peut muter
+    S.brains = np.concatenate([parents_b, mutate_brains(parents_b)])
+    S.genes = np.concatenate([parents_g, mutate_genes(parents_g)])
+
+    S.gen += 1
+    S.history.append([S.last["best"], S.last["mean"]])
+    S.history = S.history[-400:]
+    push_history(S)
+    publish(S)
 
 
-async def run_episode(theta, L):
-    if getattr(js.window.ui, "turbo", False) and hasattr(js.window, "fastEpisode"):
-        return await run_episode_fast(theta, L)
-    obs = json.loads(js.window.sim.reset())
-    steps = 0
-    max_y = H0
-    t_improve = 0.0
-    stab = 0.0              # secondes passées avec au moins 3 griffes plantées
-    fell = False
-    success = False
-    grips = [1, 1, 1, 1]
-    while steps < MAX_STEPS:
-        await pace(steps)
-        a = policy(theta, np.nan_to_num(np.array(obs, dtype=float)))
-        res = json.loads(js.window.sim.step(json.dumps(a.tolist())))
-        obs = res["obs"]
-        y = res["y"]
-        grips = res["grips"]
-        steps += 1
-        count_steps(1)
-        t = steps / 60
-        if y > max_y + 0.01:
-            max_y = y
-            t_improve = t
-        if sum(grips) >= 3:
-            stab += 1 / 60
-        if steps % 6 == 0:
-            publish(L, live=(max(0.0, max_y - H0), grips))
-        if res["fallen"]:
-            fell = True
-            break
-        if res["success"]:
-            success = True
-            break
-        if t - t_improve > STAGNATION:
-            break
-    return finish(L, max_y, stab, steps, fell, success, grips)
-
-
-def save(L):
-    js.window.localStorage.setItem(SAVE_KEY, json.dumps(L.to_dict()))
+# ---------- Sauvegarde ----------
+def save(S):
+    k = min(SAVE_TOP, POP)
+    # après une sélection, les premiers lézards sont les meilleurs, classés
+    js.window.localStorage.setItem(SAVE_KEY, json.dumps({
+        "k": k, "brains": b64(S.brains[:k]), "genes": b64(S.genes[:k]),
+        "gen": S.gen, "best_ever": S.best_ever, "history": S.history,
+    }))
 
 
 def load():
@@ -234,65 +158,53 @@ def load():
     if raw is None:
         return None
     try:
-        return Learner.from_dict(json.loads(raw))
+        d = json.loads(raw)
+        k = int(d["k"])
+        eb = unb64(d["brains"], (k, N_PARAMS))
+        eg = unb64(d["genes"], (k, N_GENES))
+        S = Population()
+        S.brains[:k] = eb
+        S.genes[:k] = eg
+        idx = np.arange(k, POP) % k             # on complète avec des copies mutées des meilleurs
+        S.brains[k:] = mutate_brains(eb[idx])
+        S.genes[k:] = mutate_genes(eg[idx])
+        S.gen = int(d.get("gen", 0))
+        S.best_ever = float(d.get("best_ever", 0.0))
+        S.history = d.get("history", [])
+        return S
     except Exception:
         return None
 
 
-async def check_save_load(L):
-    """Vérifie les boutons Sauvegarder / Charger entre deux générations."""
+async def check_save_load(S):
     if getattr(js.window, "requestSave", False):
         js.window.requestSave = False
-        save(L)
+        save(S)
     if getattr(js.window, "requestLoad", False):
         js.window.requestLoad = False
         loaded = load()
         if loaded is not None:
             push_history(loaded)
+            publish(loaded)
             return loaded
-    return L
-
-
-async def run_generation(L):
-    half = POP // 2
-    eps = np.random.randn(half, N_PARAMS)
-    noise = np.concatenate([eps, -eps])      # paires symétriques : estimation plus fiable
-    rewards = np.zeros(POP)
-    gains = []
-    for i in range(POP):
-        reward, gain, t, fell = await run_episode(L.theta + SIGMA * noise[i], L)
-        rewards[i] = reward
-        gains.append(gain)
-        L.attempts += 1
-        if fell:
-            L.falls += 1
-        L.best_gain = max(L.best_gain, gain)
-        L.best_alive = max(L.best_alive, t)
-        publish(L)
-    # Classement des récompenses (robuste aux valeurs extrêmes)
-    ranks = rewards.argsort().argsort().astype(float)
-    adv = ranks / (POP - 1) - 0.5
-    L.theta = L.theta + LR * (noise.T @ adv) / (POP * SIGMA)
-    L.gen += 1
-    L.history.append([float(max(gains)), float(np.mean(gains))])
-    L.history = L.history[-400:]
-    push_history(L)
-    publish(L)
+    return S
 
 
 async def train():
-    L = load() or Learner()
-    push_history(L)
-    publish(L)
+    S = load() or Population()
+    push_history(S)
+    publish(S)
     while True:
         try:
-            L = await check_save_load(L)
-            await run_generation(L)
-            L = await check_save_load(L)
+            S = await check_save_load(S)
+            await run_generation(S)
         except Reset:
-            L = Learner()
-            push_history(L)
-            publish(L)
+            S = Population()
+            push_history(S)
+            publish(S)
+        except Exception as e:
+            js.document.getElementById("status").textContent = "ERREUR : " + str(e)[:300]
+            raise
 
 
 asyncio.ensure_future(train())

@@ -187,7 +187,7 @@ async def run_episode_fast(theta, L):
 
 
 async def run_episode(theta, L):
-    if js.window.ui.turbo:
+    if getattr(js.window.ui, "turbo", False) and hasattr(js.window, "fastEpisode"):
         return await run_episode_fast(theta, L)
     obs = json.loads(js.window.sim.reset())
     steps = 0
